@@ -839,6 +839,12 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
 
             dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+
+            // wave64 GPUs get a register-tiled mat-mul instead of the simdgroup_matrix one
+            dev->props.has_mm_w64 = (dev->props.simd_width == 64);
+            if (getenv("GGML_METAL_MM_W64_DISABLE") != NULL) {
+                dev->props.has_mm_w64 = false;
+            }
             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
             dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
@@ -1043,6 +1049,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             GGML_LOG_INFO("%s: simdgroup reduction   = %s\n", __func__, dev->props.has_simdgroup_reduction ? "true" : "false");
             GGML_LOG_INFO("%s: simdgroup matrix mul. = %s\n", __func__, dev->props.has_simdgroup_mm        ? "true" : "false");
             GGML_LOG_INFO("%s: simd group width      = %d\n", __func__, dev->props.simd_width);
+            GGML_LOG_INFO("%s: wave64 mat-mul        = %s\n", __func__, dev->props.has_mm_w64 ? "true" : "false");
             GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");
             GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
             GGML_LOG_INFO("%s: has tensor            = %s\n", __func__, dev->props.has_tensor              ? "true" : "false");

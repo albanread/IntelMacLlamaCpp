@@ -280,6 +280,10 @@ struct ggml_metal_device_props {
     // SIMD group width of the device: 32 on Apple Silicon, 64 on AMD GCN GPUs
     int simd_width;
 
+    // a register-tiled mat-mul kernel is available for this device even though
+    // simdgroup_matrix is not - see kernel_mul_mm_w64
+    bool has_mm_w64;
+
     enum ggml_metal_device_id device_id;
 
     int op_offload_min_batch_size;

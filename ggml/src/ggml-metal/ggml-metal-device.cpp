@@ -753,9 +753,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
 
+    const bool has_mm_w64 = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_mm_w64;
+
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
-        : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
+        : (!has_mm_w64 && (op->ne[0] % 64 != 0 || op->ne[1] % 32 != 0));
 
     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
     const int16_t ne12 = (int16_t) op->src[1]->ne[2];
@@ -763,7 +765,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    const bool use_w64 = !has_tensor &&
+        ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_mm_w64;
+
+    if (use_w64) {
+        snprintf(base, 256, "kernel_mul_mm_w64_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    }
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -779,6 +788,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        // note: no fallback to kernel_mul_mm here - on wave64 hardware the simdgroup_matrix
+        //       kernel fails to compile ("call to an undefined label"), so the wave64 variant
+        //       list must cover every type the stock kernel does
+        GGML_ASSERT(res.pipeline && "missing wave64 mat-mul variant");
 
         ggml_metal_cv_free(cv);
     }

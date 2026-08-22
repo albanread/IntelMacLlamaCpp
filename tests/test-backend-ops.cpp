@@ -9150,6 +9150,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 64, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4096, 128, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 33, 1024, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 129, 64, 1057, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4096, 512, 12288, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, 64, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4096, 128, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 33, 1024, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 129, 64, 1057, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4096, 512, 12288, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 64, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 128, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1024, 33, 1024, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 129, 64, 1057, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 512, 12288, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 64, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4096, 128, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, 33, 1024, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 129, 64, 1057, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4096, 512, 12288, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 64, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 4096, 128, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 1024, 33, 1024, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 129, 64, 1057, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 4096, 512, 12288, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 64, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 128, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 33, 1024, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 129, 64, 1057, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 512, 12288, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 256, 64, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 4096, 128, 4096, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1024, 33, 1024, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 129, 64, 1057, {1, 1}, {1, 1})); // W64MM
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 4096, 512, 12288, {1, 1}, {1, 1})); // W64MM
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4096, 1, 4096, {1, 1}, {1, 1})); // VEGA-REALSHAPE
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 1, 4096, {1, 1}, {1, 1})); // VEGA-REALSHAPE
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4096, 1, 12288, {1, 1}, {1, 1})); // VEGA-REALSHAPE

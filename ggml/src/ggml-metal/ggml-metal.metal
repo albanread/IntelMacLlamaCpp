@@ -10674,6 +10674,229 @@ kernel void kernel_mul_mm(
 
 #endif // GGML_METAL_HAS_TENSOR
 
+// ---------------------------------------------------------------------------------------
+// wave64 matrix-matrix multiply, for GPUs without simdgroup_matrix (AMD GCN on macOS).
+//
+// simdgroup_matrix is gated on MTLGPUFamilyApple7, so on these cards ggml falls back to
+// mat-vec kernels for prompt processing - one output column at a time. That is why prefill
+// runs at a fraction of the card's fp32 peak and why speculative decoding is unprofitable
+// (verifying K drafted tokens costs ~Kx instead of ~1x).
+//
+// This is a plain register-tiled GEMM: stage A and B in threadgroup memory, accumulate in
+// registers. No matrix intrinsics, so it works anywhere, and the 64-wide wavefront is used
+// simply as 64 independent lanes.
+//
+//   threadgroup : 4 simdgroups x 64 lanes = 256 threads
+//   tile        : 64 (M) x 32 (N), stepping K in chunks of 32
+//   per thread  : 4 (M) x 2 (N) = 8 accumulators in registers
+//
+// Threadgroup layout is chosen for the inner loop: sa is k-major so each thread reads its
+// 4 rows as one half4, sb is k-major so its 2 columns are one half2. Shared-memory size is
+// identical to the simdgroup kernel it replaces (4096 + 2048), so the host allocation is
+// unchanged.
+// ---------------------------------------------------------------------------------------
+
+#define MM_W64_NR0 64   // rows of C per threadgroup (M)
+#define MM_W64_NR1 32   // cols of C per threadgroup (N)
+#define MM_W64_NK  32   // K step
+#define MM_W64_TM  4    // rows per thread
+#define MM_W64_TN  2    // cols per thread
+
+template<
+    typename S0, typename S0_4x4,
+    typename S1,
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &),
+    typename T0, typename T0_4x4, typename T1>
+kernel void kernel_mul_mm_w64(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
+
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);                       // [MM_W64_NK][64]
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);                // [MM_W64_NK][32]
+
+    const int K  = args.ne00;
+    const int M  = args.ne0;
+    const int N  = args.ne1;
+
+    const int im  = tgpig.z;
+    const int r0  = tgpig.y*MM_W64_NR0;
+    const int r1  = tgpig.x*MM_W64_NR1;
+
+    const int i12 = im % FC_mul_mm_ne12;
+    const int i13 = im / FC_mul_mm_ne12;
+
+    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
+
+    // this thread's 4x2 patch of the output tile
+    const short tm = (tiitg % 16) * MM_W64_TM;   // 0,4,..,60
+    const short tn = (tiitg / 16) * MM_W64_TN;   // 0,2,..,30
+
+    float acc[MM_W64_TM][MM_W64_TN];
+    FOR_UNROLL (short i = 0; i < MM_W64_TM; ++i) {
+        FOR_UNROLL (short j = 0; j < MM_W64_TN; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    for (int loop_k = 0; loop_k < K; loop_k += MM_W64_NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- stage A: 64 rows x 32 k. Each dequantize call yields 16 k, so 128 calls;
+        //     threads 0..127 do one each.
+        if (tiitg < 128) {
+            const short row   = tiitg / 2;              // 0..63
+            const short chunk = tiitg % 2;              // which 16-wide k chunk
+            const int   k_pos = loop_k + chunk*16;
+
+            const int  gr = r0 + row;
+            const bool row_ok = gr < M;
+
+            S0 vals[16];
+
+            if (!row_ok) {
+                FOR_UNROLL (short i = 0; i < 16; ++i) vals[i] = (S0) 0;
+            } else if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
+                // unquantised A with K not a multiple of 32: nb01 may leave 4x4 loads
+                // misaligned, so read elementwise
+                device const T0 * rp = (device const T0 *)(src0 + args.nb01*gr + offset0);
+                FOR_UNROLL (short i = 0; i < 16; ++i) {
+                    vals[i] = (k_pos + i < K) ? (S0) rp[k_pos + i] : (S0) 0;
+                }
+            } else {
+                const int   blk = k_pos / (16*nl);
+                const short il  = (k_pos / 16) % nl;
+
+                device const block_q * rp = (device const block_q *)(src0 + args.nb01*gr + offset0);
+
+                S0_4x4 tmp;
+                dequantize_func(rp + blk, il, tmp);
+
+                FOR_UNROLL (short i = 0; i < 16; ++i) {
+                    vals[i] = (k_pos + i < K) ? (S0) tmp[i/4][i%4] : (S0) 0;
+                }
+            }
+
+            FOR_UNROLL (short i = 0; i < 16; ++i) {
+                sa[(chunk*16 + i)*MM_W64_NR0 + row] = vals[i];
+            }
+        } else {
+            // --- stage B: 32 k x 32 n, 128 threads, 8 values each
+            const short t  = tiitg - 128;
+            const short n  = t / 4;                     // 0..31
+            const short k0 = (t % 4) * 8;               // 0,8,16,24
+
+            const int  gc = r1 + n;
+            const bool col_ok = gc < N;
+
+            device const T1 * y = (device const T1 *)(src1
+                    + args.nb13*i13
+                    + args.nb12*i12
+                    + args.nb11*gc);
+
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
+                const int k = loop_k + k0 + i;
+                sb[(k0 + i)*MM_W64_NR1 + n] = (col_ok && k < K) ? (S1) y[k] : (S1) 0;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- accumulate this K chunk
+        FOR_UNROLL (short k = 0; k < MM_W64_NK; ++k) {
+            S0 a[MM_W64_TM];
+            S1 b[MM_W64_TN];
+
+            FOR_UNROLL (short i = 0; i < MM_W64_TM; ++i) a[i] = sa[k*MM_W64_NR0 + tm + i];
+            FOR_UNROLL (short j = 0; j < MM_W64_TN; ++j) b[j] = sb[k*MM_W64_NR1 + tn + j];
+
+            FOR_UNROLL (short i = 0; i < MM_W64_TM; ++i) {
+                FOR_UNROLL (short j = 0; j < MM_W64_TN; ++j) {
+                    acc[i][j] = fma((float) a[i], (float) b[j], acc[i][j]);
+                }
+            }
+        }
+    }
+
+    // --- write out
+    device float * C = (device float *) dst + im*N*(size_t)M;
+
+    FOR_UNROLL (short j = 0; j < MM_W64_TN; ++j) {
+        const int gc = r1 + tn + j;
+        if (gc >= N) continue;
+
+        FOR_UNROLL (short i = 0; i < MM_W64_TM; ++i) {
+            const int gr = r0 + tm + i;
+            if (gr >= M) continue;
+
+            C[gr + (size_t)gc*M] = acc[i][j];
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_w64<half, half4x4, half, float4x4, 1, dequantize_f32, float, float4x4, float>) mul_mm_w64_t;
+
+template [[host_name("kernel_mul_mm_w64_f32_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, float4x4, 1, dequantize_f32, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_f16_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, half4x4, 1, dequantize_f16, half, half4x4, float>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_mul_mm_w64_bf16_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, bfloat4x4, 1, dequantize_bf16, bfloat, bfloat4x4, float>;
+#endif
+template [[host_name("kernel_mul_mm_w64_q1_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q1_0, 8, dequantize_q1_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q2_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q2_0, 4, dequantize_q2_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q4_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q4_0, 2, dequantize_q4_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q4_1_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q4_1, 2, dequantize_q4_1, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q5_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q5_0, 2, dequantize_q5_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q5_1_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q5_1, 2, dequantize_q5_1, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q8_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q8_0, 2, dequantize_q8_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_mxfp4_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_mxfp4, 2, dequantize_mxfp4, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q2_K_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q3_K_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q4_K_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q5_K_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_q6_K_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_iq2_xxs_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_iq2_xs_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq2_xs, QK_NL, dequantize_iq2_xs, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_iq3_xxs_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_iq3_s_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq3_s, QK_NL, dequantize_iq3_s, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_iq2_s_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq2_s, QK_NL, dequantize_iq2_s, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_iq1_s_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq1_s, QK_NL, dequantize_iq1_s, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_iq1_m_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq1_m, QK_NL, dequantize_iq1_m, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_iq4_nl_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq4_nl, 2, dequantize_iq4_nl, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_iq4_xs_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq4_xs, QK_NL, dequantize_iq4_xs, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_tq2_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_tq2_0, QK_NL, dequantize_tq2_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_w64_f32_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, float4x4, 1, dequantize_f32, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_f16_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, half4x4, 1, dequantize_f16, half, half4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q1_0_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q1_0, 8, dequantize_q1_0, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q2_0_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q2_0, 4, dequantize_q2_0, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q4_0_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q4_0, 2, dequantize_q4_0, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q4_1_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q4_1, 2, dequantize_q4_1, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q5_0_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q5_0, 2, dequantize_q5_0, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q5_1_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q5_1, 2, dequantize_q5_1, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q8_0_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q8_0, 2, dequantize_q8_0, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_mxfp4_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_mxfp4, 2, dequantize_mxfp4, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q2_K_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q3_K_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q3_K, QK_NL, dequantize_q3_K, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q4_K_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q5_K_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_q6_K_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_iq2_xxs_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_iq2_xs_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq2_xs, QK_NL, dequantize_iq2_xs, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_iq3_xxs_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_iq3_s_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq3_s, QK_NL, dequantize_iq3_s, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_iq2_s_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq2_s, QK_NL, dequantize_iq2_s, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_iq1_s_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq1_s, QK_NL, dequantize_iq1_s, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_iq1_m_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq1_m, QK_NL, dequantize_iq1_m, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_iq4_nl_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq4_nl, 2, dequantize_iq4_nl, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_iq4_xs_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_iq4_xs, QK_NL, dequantize_iq4_xs, float, float4x4, half>;
+template [[host_name("kernel_mul_mm_w64_tq2_0_f16")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_tq2_0, QK_NL, dequantize_tq2_0, float, float4x4, half>;
+
+
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
         constant ggml_metal_kargs_mul_mm_id_map0 & args,
