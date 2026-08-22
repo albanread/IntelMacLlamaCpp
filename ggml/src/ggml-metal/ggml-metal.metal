@@ -10947,9 +10947,13 @@ kernel void kernel_mul_mm_id_w64(
 
             device const T1 * y = nullptr;
             if (col_ok) {
-                const int   id  = ids_i32[im*args.ne21 + r1 + n];
-                const short i11 = (id % args.ne20) % args.ne11;
-                const short i12 = (id / args.ne20);
+                const int id = ids_i32[im*args.ne21 + r1 + n];
+
+                // note: these MUST be int, not short. Multiplying a uint64 stride by a short
+                // is miscompiled on AMD's Metal compiler - the short lands in the high word,
+                // so nb12*128 comes out as nb12<<32 and the read lands far out of bounds.
+                const int i11 = (id % args.ne20) % args.ne11;
+                const int i12 = (id / args.ne20);
 
                 y = (device const T1 *)(src1 + args.nb11*i11 + args.nb12*i12);
             }
@@ -10982,9 +10986,9 @@ kernel void kernel_mul_mm_id_w64(
         const int col = r1 + tn + j;
         if (col >= neh1) continue;
 
-        const int   id  = ids_i32[im*args.ne21 + col];
-        const short ide = id % args.ne20;
-        const short idt = id / args.ne20;
+        const int id  = ids_i32[im*args.ne21 + col];
+        const int ide = id % args.ne20;   // int, not short - see the note in the B load above
+        const int idt = id / args.ne20;
 
         device float * D = (device float *) dst + ide*args.ne0 + idt*(size_t)args.ne1*args.ne0;
 
