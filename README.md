@@ -288,6 +288,62 @@ The progression, for the record:
 
 ---
 
+## Making it faster — what actually works here
+
+The usual tuning advice assumes a CUDA card with flash-attention. Most of it is wrong on
+this hardware, sometimes badly. Measured on Qwen3-8B-Q4_K_M:
+
+### Already on, and worth more than everything else combined
+
+**Prompt prefix caching.** llama-server keeps the KV cache per slot and only evaluates the
+tokens you added, so a follow-up question does not reprocess the conversation:
+
+| | time |
+|---|---:|
+| first turn, ~1460-token prompt | 21.19 s |
+| follow-up, same prefix | **1.56 s** |
+| fully warm | **1.30 s** |
+
+**13.6×.** Nothing else on this list comes close. The practical consequence for anything
+built on top: *do not modify the front of the conversation*. Dropping the oldest messages
+to save context invalidates the prefix and forces a full reprocess. If you must trim, trim
+in large steps with hysteresis so you pay that cost rarely rather than every turn.
+
+### Actively harmful here
+
+**KV cache quantization (`-ctk`/`-ctv q8_0`) — do not use.**
+
+| KV type | prefill | generation |
+|---|---:|---:|
+| f16 (default) | 48.1 | **33.1** |
+| q8_0 | 45.4 | **14.1** |
+
+Generation drops **57%**. Dequantizing K/V inside attention costs far more than the
+bandwidth it saves, because the flash-attention kernels that normally absorb that cost are
+disabled on any non-Apple7 GPU.
+
+**Speculative decoding — also a loss**, whether by draft model or n-gram:
+
+| | generation |
+|---|---:|
+| baseline | 25.1 t/s |
+| draft model (Qwen3-0.6B Q8_0) | **15.3 t/s** |
+| n-gram (`ngram-simple`/`map-k`/`mod`) | 24–26 t/s (noise) |
+
+The draft model is not the problem — acceptance was **65%, mean accepted length 2.95**,
+which would normally be a solid win. The problem is verification. Speculation assumes
+checking K drafted tokens costs about as much as generating one, which requires a batched
+**mat-mul**. This card only has the mat-**vec** fallback, so verifying ~4 tokens costs
+roughly 4×, and you pay for the draft model on top.
+
+### The single thing that would change all of this
+
+Every item above traces back to `has_simdgroup_mm` being gated on `MTLGPUFamilyApple7`.
+It costs prefill throughput directly (~6% of the card's fp32 peak; the CPU beats the GPU
+at prompt processing), and it is *also* what makes speculative decoding unprofitable. A
+wave64 `mul_mm` written with `simd_shuffle` instead of `simdgroup_matrix` would unlock
+both at once. That is the highest-value contribution anyone could make to this fork.
+
 ## ⚠️ Do not run the full `test-backend-ops` suite on this hardware
 
 It will hang the GPU and take your desktop session with it.
