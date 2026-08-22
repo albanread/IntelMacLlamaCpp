@@ -102,26 +102,41 @@ This matters much less for MoE, which narrows the GPU's prefill deficit to 1.35�
 
 ## Is it actually right?
 
-Correct-looking text is not evidence. These backends were checked against the CPU
-backend on identical input, which is the only thing that catches subtly-wrong
-output:
+Correct-looking text is not evidence, so both models were measured against the CPU backend
+on **wikitext-2** (the standard corpus), 80 chunks each, comparing per-chunk log-likelihood:
 
-```
-Qwen3-8B      Vega II  PPL 23.2535   CPU  PPL 23.2960    delta -0.18%
-Qwen3-30B-A3B Vega II  PPL 23.4508   CPU  PPL 23.2909    delta +0.69%
-```
+| model | GPU | CPU | delta | paired t |
+|---|---:|---:|---:|---:|
+| Qwen3-30B-A3B (MoE) | 9.6700 | 9.6356 | **+0.357%** | +2.69 |
+| Qwen3-8B (dense) | 10.5178 | 10.5342 | **−0.156%** | −2.59 |
 
-Both deltas are floating-point reduction-order noise. The MoE figure was
-investigated specifically — top-k expert routing runs through `argsort`/`top_k`,
-and wrong routing yields fluent-but-worse text rather than an obvious failure.
-Per-chunk residuals straddle zero (the GPU is *better* on 3 of 12 chunks),
-t = 2.06 / p = 0.064, and `TOP_K`/`ARGSORT` both pass at `ne = 128`, this model's
-exact expert count. The residual is consistent with expert flips on near-tied
-router scores, where both backends make an equally valid choice, and it sits well
-below Q4_K_M's own ~1–3% quantization cost.
+Read these carefully, because the naive reading is wrong in both directions.
 
-If you port this to other AMD hardware, re-run that comparison rather than
-trusting the output — `llama-perplexity` against `-ngl 0` on the same text file.
+**These deltas are systematic, not run noise.** Both exceed |t| = 2, and re-running with a
+different `ubatch` reproduces the GPU number bit-for-bit. Anyone claiming a GPU backend is
+"identical" to CPU on the strength of a single perplexity number is over-claiming.
+
+**But they are not a routing bug either.** The dense control deviates just as significantly
+as the MoE model and in the *opposite* direction — the GPU is slightly *better* there. A
+genuine MoE routing fault would make MoE worse while leaving the dense control at t ≈ 0.
+What this actually shows is that the Metal and CPU backends differ by a small, systematic
+amount whose sign depends on the model, which is what accumulated floating-point divergence
+looks like. The MoE magnitude is about twice the dense one, consistent with expert selection
+being a discrete `argmax` that can flip when two of 128 experts score within rounding error —
+both choices being equally legitimate.
+
+At ≤0.36% this sits well under Q4_K_M's own ~1–3% quantization cost, so it does not matter
+in practice. Supporting checks: `TOP_K` and `ARGSORT` both pass at `ne = 128`, this model's
+exact expert count, and every k-quant passes at the real `k = 4096 / 12288` shapes.
+
+**A methodological warning if you repeat this.** `llama-perplexity` prints *cumulative*
+perplexity. Read as per-chunk it manufactures a tidy monotone "error that starts large and
+decays", which is purely an averaging artifact — it nearly produced a false positive here.
+Differentiate the series first (`n·log(cumₙ) − (n−1)·log(cumₙ₋₁)`), then look at the signs
+of the residuals: noise straddles zero, a real fault does not.
+
+If you port this to other AMD hardware, re-run the comparison rather than trusting output:
+`llama-perplexity -f wiki.test.raw -c 512 --chunks 80` with `-ngl 99` and then `-ngl 0`.
 
 ## The hardware, and why it is awkward
 
