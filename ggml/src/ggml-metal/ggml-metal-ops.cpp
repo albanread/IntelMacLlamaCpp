@@ -1075,7 +1075,9 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     const uint64_t nbt2 = net1*nbt1;
     const uint64_t nbt3 = net2*nbt2;
 
-    const size_t smem = GGML_PAD(32*sizeof(float), 16);
+    // note: the kernel writes shmem_f32[tiisg] across a full simdgroup, so this must cover
+    //       N_SIMDWIDTH floats - not 32 - or wave64 devices write out of bounds
+    const size_t smem = GGML_PAD(GGML_METAL_NW*sizeof(float), 16);
 
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
