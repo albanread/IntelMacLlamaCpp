@@ -1037,7 +1037,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
-    snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // NOTE: the wave64 mat-mul-id kernel is NOT yet correct - it produces a wrong result for
+    //       roughly one column in every 129 when an expert owns more than one 32-column tile
+    //       (NMSE ~= 1/n). Opt in with GGML_METAL_MM_ID_W64_ENABLE=1 to work on it.
+    const bool use_w64_id = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_mm_w64 &&
+                            getenv("GGML_METAL_MM_ID_W64_ENABLE") != NULL;
+
+    if (use_w64_id) {
+        snprintf(base, 256, "kernel_mul_mm_id_w64_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    }
     snprintf(name, 256, "%s_bci=%d", base, bc_inp);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

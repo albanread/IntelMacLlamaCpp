@@ -2359,7 +2359,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
-    const int ne11_mm_min = 8;
+    // batch size above which the mat-mul kernel beats the small-batch mat-vec ones.
+    // tunable for experiments (e.g. speculative decoding verifies only a few tokens at a time)
+    static const int ne11_mm_min = getenv("GGML_METAL_MM_MIN") ? atoi(getenv("GGML_METAL_MM_MIN")) : 8;
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
@@ -2621,9 +2623,12 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // to the matrix-vector kernel
     // ne20 = n_used_experts
     // ne21 = n_rows (batch size)
-    const int ne21_mm_id_min = 32;
+    static const int ne21_mm_id_min = getenv("GGML_METAL_MM_ID_MIN") ? atoi(getenv("GGML_METAL_MM_ID_MIN")) : 32;
 
-    if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
+    const bool use_mm_id = props_dev->has_simdgroup_mm ||
+                          (props_dev->has_mm_w64 && getenv("GGML_METAL_MM_ID_W64_ENABLE") != NULL);
+
+    if (use_mm_id && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
         // some Metal matrix data types require aligned pointers
         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
         //switch (op->src[0]->type) {
@@ -2708,7 +2713,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            // 4 simdgroups: 128 threads at width 32, 256 at width 64
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, GGML_METAL_NW*4, 1, 1);
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
