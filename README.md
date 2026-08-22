@@ -9,13 +9,17 @@ This fork fixes that.
 
 Verified on a **Mac Pro (2019, MacPro7,1)** running **macOS 26.3.1**:
 
-| | prefill (pp128) | generation (tg64) |
+| model | prefill (pp512) | generation (tg64) |
 |---|---:|---:|
-| **Radeon Pro Vega II — Metal, this fork** | **50.0 t/s** | **32.4 t/s** |
-| Xeon W-3235, 24 threads — CPU | 64.1 t/s | 14.1 t/s |
-| Radeon Pro Vega II — Metal, upstream | *garbage output* | *garbage output* |
+| **Qwen3-30B-A3B** (MoE, Q4_K_M, 17.3 GB) | **88.5 t/s** | **46.6 t/s** |
+| **Qwen3-8B** (dense, Q4_K_M, 4.7 GB) | 48.4 t/s | 32.9 t/s |
+| either model on upstream llama.cpp | *garbage output* | *garbage output* |
 
-Model: `Qwen3-8B-Q4_K_M` (4.68 GiB, 8.19B params). Generation is **2.3× the CPU**.
+Yes — a **30B model runs faster than an 8B** here. Qwen3-30B-A3B activates only
+~3B parameters (8 of 128 experts) per token, so it is both quicker *and* far more
+capable. It is the model to run on this hardware. Verified correct against the CPU
+backend, routing included (see [Is it actually right?](#is-it-actually-right)).
+
 Upstream's README is preserved as [README.upstream.md](README.upstream.md).
 
 Forked from upstream `e85caa81ea2b65797396018c179b87ad61fa38ab` (2026-08-22).
@@ -31,8 +35,15 @@ cmake --build build -j
 
 ```bash
 GGML_METAL_DEVICE=Vega ./build/bin/llama-cli \
-  -m Qwen3-8B-Q4_K_M.gguf -ngl 99 -lm none -st \
+  -m Qwen3-30B-A3B-Q4_K_M.gguf -ngl 99 -lm none -st \
   -p "The capital of France is"
+```
+
+Get the model (18.6 GB) from the official Qwen repo:
+
+```bash
+curl -L -C - -o Qwen3-30B-A3B-Q4_K_M.gguf \
+  https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf
 ```
 
 Two flags matter enormously on this hardware:
@@ -43,6 +54,74 @@ Two flags matter enormously on this hardware:
   memory and every matmul reads across PCIe: **~2 t/s instead of ~32 t/s**, a 16× penalty.
 
 ---
+
+## What to run on 32 GB of VRAM
+
+The card is **kernel-bound, not bandwidth-bound** — the dense 8B sustains only
+~152 GiB/s of an HBM2 part capable of ~1 TB/s. So speed tracks *bytes read per
+token*, which is why MoE wins so decisively, and why a higher quant costs less
+speed than you would expect.
+
+| model | quant | weights | generation |
+|---|---|---:|---:|
+| **Qwen3-30B-A3B** | **Q4_K_M** | **17.3 GB** | **46.6 t/s** (measured) |
+| Qwen3-30B-A3B | Q5_K_M / Q6_K | 21.7 / 25.1 GB | fits, ~5–15% slower |
+| Qwen3-8B | Q4_K_M | 4.7 GB | 32.9 t/s (measured) |
+| Qwen3-8B | Q8_0 | 8.1 GB | ~19 t/s |
+| Qwen3-14B | Q5_K_M / Q6_K | 10–11 GB | ~14 t/s |
+| Qwen3-32B (dense) | Q4_K_M | 18.5 GB | ~8 t/s |
+| anything 70B | — | ≥31 GB | will not fit with a KV cache |
+
+### Quantization: use K-quants, avoid the IQ family
+
+Verified correct on this card at real model shapes (k = 4096 and 12288, not just
+the suite's k = 256):
+
+> `q4_0` `q4_1` `q8_0` `q2_K` `q3_K` `q4_K` `q5_K` `q6_K` `mxfp4`
+
+**Broken here — do not use:** `iq2_xxs` is measurably wrong at large k (fails
+24/24), and `iq2_xs` **hangs the GPU**, which on this hardware takes the desktop
+session down with it (see the warning below). The rest of the IQ family is
+untriaged. `mxfp4` passing means gpt-oss-style models should work.
+
+### Prompt-heavy work: the CPU is still better at prefill
+
+Because `simdgroup_matrix` is unavailable, prompt processing falls back to
+mat-vec kernels and the Xeon beats the GPU at it. For the dense 8B, a *partial*
+offload is faster than either extreme:
+
+| `-ngl` | prefill (pp2048) | generation |
+|---:|---:|---:|
+| 0 (CPU) | 77 | 15.3 |
+| **12** | **91.5** | 17.1 |
+| 36 (all GPU) | 46.5 | **31.3** |
+
+Rule of thumb: use `-ngl 12` when your prompt is more than ~2.5× your expected
+output (summarising a long document); use `-ngl 99` otherwise (chat, agents).
+This matters much less for MoE, which narrows the GPU's prefill deficit to 1.35×.
+
+## Is it actually right?
+
+Correct-looking text is not evidence. These backends were checked against the CPU
+backend on identical input, which is the only thing that catches subtly-wrong
+output:
+
+```
+Qwen3-8B      Vega II  PPL 23.2535   CPU  PPL 23.2960    delta -0.18%
+Qwen3-30B-A3B Vega II  PPL 23.4508   CPU  PPL 23.2909    delta +0.69%
+```
+
+Both deltas are floating-point reduction-order noise. The MoE figure was
+investigated specifically — top-k expert routing runs through `argsort`/`top_k`,
+and wrong routing yields fluent-but-worse text rather than an obvious failure.
+Per-chunk residuals straddle zero (the GPU is *better* on 3 of 12 chunks),
+t = 2.06 / p = 0.064, and `TOP_K`/`ARGSORT` both pass at `ne = 128`, this model's
+exact expert count. The residual is consistent with expert flips on near-tied
+router scores, where both backends make an equally valid choice, and it sits well
+below Q4_K_M's own ~1–3% quantization cost.
+
+If you port this to other AMD hardware, re-run that comparison rather than
+trusting the output — `llama-perplexity` against `-ngl 0` on the same text file.
 
 ## The hardware, and why it is awkward
 
@@ -244,9 +323,14 @@ ADD/MUL/SCALE/CPY/CONT/GLU/DIV        all FAIL=0
   audited for wave64). This is what triggered the WindowServer kill.
 - **`DSV4_HC_PRE/POST/COMB` fail** (DeepSeek-V4 hybrid-context ops, ERR ≈ 0.4–1.1). Not on
   any path used here.
-- **Prefill is slower than the CPU** (50 vs 64 t/s) because `simdgroup_matrix` is
-  unavailable, so prompt processing falls back to mat-vec kernels. A wave64 `mul_mm` written
-  with SIMD shuffles is the obvious next win.
+- **Prefill is slower than the CPU** because `simdgroup_matrix` is unavailable, so prompt
+  processing falls back to mat-vec kernels — the GPU manages only ~6% of its ~14 TFLOPS fp32
+  peak. **A wave64 `mul_mm` built on `simd_shuffle` rather than `simdgroup_matrix` is the
+  single largest piece of unclaimed performance here**, and the most useful contribution
+  anyone could make to this fork.
+- **MoE prefill is stuck on the mat-vec path too.** `ggml-metal-ops.cpp` gates the expert
+  mat-*mul* on `has_simdgroup_mm`, so `mul_mv_id` is always used. Generation is unaffected
+  (mat-vec is the right kernel for one token); long-prompt MoE work pays for it.
 - Nothing here is tested on Apple Silicon. The changes are written to be no-ops there — the
   probe returns 32 and concurrency stays enabled — but that is unverified.
 
