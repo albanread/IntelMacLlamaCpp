@@ -88,7 +88,6 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2);
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
-void ggml_metal_encoder_set_barrier_via_restart(ggml_metal_encoder_t encoder, bool enable);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 

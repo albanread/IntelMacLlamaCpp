@@ -467,24 +467,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
 
-    // kept so the encoder can be restarted to enforce a hard memory barrier
-    id<MTLCommandBuffer> cmd_buf;
-
-    bool concurrent;
-
-    // some drivers (e.g. AMD discrete GPUs) do not enforce memoryBarrierWithScope: between
-    // concurrently dispatched kernels - on those, end and restart the encoder instead, which
-    // Metal guarantees to be a full memory barrier
-    bool barrier_via_restart;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
-
-    res->cmd_buf    = cmd_buf;
-    res->concurrent = concurrent;
 
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
@@ -495,10 +483,6 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
     [res->obj retain];
 
     return res;
-}
-
-void ggml_metal_encoder_set_barrier_via_restart(ggml_metal_encoder_t encoder, bool enable) {
-    encoder->barrier_via_restart = enable;
 }
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
@@ -534,23 +518,14 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 
+// NOTE: this does not actually order buffer access between concurrently dispatched kernels on
+//       AMD GPUs under macOS. Three mechanisms were tried and none works there:
+//       memoryBarrierWithScope: (ignored), ending/restarting the encoder (discards encoder
+//       state multi-dispatch ops rely on), and MTLFence update/wait, singly and pooled
+//       (results became deterministic but stayed wrong). Forcing a barrier before *every* op
+//       is still wrong, which rules out the dependency analysis and pins it on the primitive.
+//       Concurrent dispatch is therefore restricted to Apple GPUs; see ggml_metal_init.
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
-    if (encoder->barrier_via_restart) {
-        // end the current encoder and start a new one - this is a full memory barrier on all drivers
-        [encoder->obj endEncoding];
-        [encoder->obj release];
-
-        if (encoder->concurrent) {
-            encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
-        } else {
-            encoder->obj = [encoder->cmd_buf computeCommandEncoder];
-        }
-
-        [encoder->obj retain];
-
-        return;
-    }
-
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 

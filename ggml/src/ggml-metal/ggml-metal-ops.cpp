@@ -49,26 +49,6 @@ struct ggml_metal_op {
         this->use_fusion      = use_fusion;
         this->use_concurrency = use_concurrency;
 
-        // AMD/Intel GPUs do not reliably honour memoryBarrierWithScope: between concurrent
-        // dispatches - fall back to restarting the encoder, which is always a full barrier
-        {
-            const bool is_apple_gpu = ggml_metal_device_get_props(dev)->supports_gpu_family_apple7;
-
-            // note: restarting the encoder loses encoder state that multi-dispatch ops rely on,
-            //       so it is opt-in only - the safe path for these GPUs is serial dispatch (below)
-            bool via_restart = false;
-
-            GGML_UNUSED(is_apple_gpu);
-
-            if (getenv("GGML_METAL_BARRIER_RESTART_DISABLE") != NULL) {
-                via_restart = false;
-            }
-            if (getenv("GGML_METAL_BARRIER_RESTART_ENABLE") != NULL) {
-                via_restart = true;
-            }
-
-            ggml_metal_encoder_set_barrier_via_restart(this->enc, via_restart);
-        }
         this->use_capture     = use_capture;
         this->debug_graph     = debug_graph;
         this->debug_fusion    = debug_fusion;
@@ -182,6 +162,13 @@ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
 
 static bool ggml_metal_op_concurrency_check(ggml_metal_op_t ctx, const ggml_tensor * node) {
     if (!ctx->mem_ranges) {
+        return false;
+    }
+
+    // diagnostic: never allow concurrency, so a barrier is emitted before every op.
+    // if results are still wrong with this set, the barrier primitive itself is not
+    // ordering; if they are correct, the dependency analysis is what is missing something.
+    if (getenv("GGML_METAL_BARRIER_EVERY_OP") != NULL) {
         return false;
     }
 
