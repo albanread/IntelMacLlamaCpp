@@ -8686,8 +8686,12 @@ void kernel_mul_mv_q5_K_f32_impl(
     device const float * y1 = yy + ix*QK_K + y_offset;
 
     for (int i = ix; i < nb; i += N_SIMDWIDTH/8) {
-        device const uint8_t * q1 = x[i].qs + q_offset;
-        device const uint8_t * qh = x[i].qh + l0;
+        // note: read the quants 16 bits at a time. Byte-wise loads here cost this kernel
+        //       more than half its bandwidth on wave64 hardware - the arithmetic is nearly
+        //       free by comparison (stripping it entirely gains only ~2%).
+        //       qh sits at offset 16 and qs at 48 in a 176-byte block, so both are aligned.
+        device const uint16_t * q1 = (device const uint16_t *)(x[i].qs) + q_offset/2;
+        device const uint16_t * qh = (device const uint16_t *)(x[i].qh) + l0/2;
         device const half * dh = &x[i].d;
         device const uint16_t * a = (device const uint16_t *)x[i].scales + iq;
 
@@ -8701,7 +8705,7 @@ void kernel_mul_mv_q5_K_f32_impl(
         }
 
         for (short row = 0; row < nr0; ++row) {
-            device const uint8_t * q2 = q1 + 64;
+            device const uint16_t * q2 = q1 + 32;   // +64 bytes
 
             sc16[0] = a[0] & kmask1;
             sc16[1] = a[2] & kmask1;
@@ -8710,16 +8714,23 @@ void kernel_mul_mv_q5_K_f32_impl(
 
             float4 acc1 = {0.f};
             float4 acc2 = {0.f};
-            FOR_UNROLL (short l = 0; l < 8; ++l) {
-                uint8_t h = qh[l];
-                acc1[0] += yl[l+0] * (q1[l] & 0x0F);
-                acc1[1] += yl[l+8] * (q1[l] & 0xF0);
-                acc1[2] += yh[l+0] * (q2[l] & 0x0F);
-                acc1[3] += yh[l+8] * (q2[l] & 0xF0);
-                acc2[0] += h & hm1 ? yl[l+0] : 0.f;
-                acc2[1] += h & hm2 ? yl[l+8] : 0.f;
-                acc2[2] += h & hm3 ? yh[l+0] : 0.f;
-                acc2[3] += h & hm4 ? yh[l+8] : 0.f;
+            FOR_UNROLL (short l = 0; l < 4; ++l) {
+                const uint16_t w1 = q1[l];
+                const uint16_t w2 = q2[l];
+                const uint16_t hw = qh[l];
+
+                const uint8_t ha = hw & 0xFF;   // was qh[2*l]
+                const uint8_t hb = hw >> 8;     // was qh[2*l + 1]
+
+                acc1[0] += yl[2*l+0] * (w1 & 0x000F) + yl[2*l+1] * (w1 & 0x0F00) * (1.f/256.f);
+                acc1[1] += yl[2*l+8] * (w1 & 0x00F0) + yl[2*l+9] * (w1 & 0xF000) * (1.f/256.f);
+                acc1[2] += yh[2*l+0] * (w2 & 0x000F) + yh[2*l+1] * (w2 & 0x0F00) * (1.f/256.f);
+                acc1[3] += yh[2*l+8] * (w2 & 0x00F0) + yh[2*l+9] * (w2 & 0xF000) * (1.f/256.f);
+
+                acc2[0] += (ha & hm1 ? yl[2*l+0] : 0.f) + (hb & hm1 ? yl[2*l+1] : 0.f);
+                acc2[1] += (ha & hm2 ? yl[2*l+8] : 0.f) + (hb & hm2 ? yl[2*l+9] : 0.f);
+                acc2[2] += (ha & hm3 ? yh[2*l+0] : 0.f) + (hb & hm3 ? yh[2*l+1] : 0.f);
+                acc2[3] += (ha & hm4 ? yh[2*l+8] : 0.f) + (hb & hm4 ? yh[2*l+9] : 0.f);
             }
 
             sumf[row] += dh[0] * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
@@ -8728,8 +8739,8 @@ void kernel_mul_mv_q5_K_f32_impl(
                                   sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
                          dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
-            q1 += args.nb01;
-            qh += args.nb01;
+            q1 += args.nb01/2;
+            qh += args.nb01/2;
             dh += args.nb01/2;
             a  += args.nb01/2;
         }
@@ -8810,9 +8821,12 @@ void kernel_mul_mv_q6_K_f32_impl(
     const short q_offset_h =  32*ip + l0;
 
     for (int i = ix; i < nb; i += N_SIMDWIDTH/16) {
-        device const uint8_t * q1 = x[i].ql + q_offset_l;
-        device const uint8_t * q2 = q1 + 32;
-        device const uint8_t * qh = x[i].qh + q_offset_h;
+        // note: 16-bit loads, as in the q4_K kernel. Byte-wise loads cost this kernel a large
+        //       share of its bandwidth on wave64 hardware. ql sits at offset 0 and qh at 128
+        //       in a 210-byte block, and both offsets are even, so the cast is aligned.
+        device const uint16_t * q1 = (device const uint16_t *)(x[i].ql) + q_offset_l/2;
+        device const uint16_t * q2 = q1 + 16;   // +32 bytes
+        device const uint16_t * qh = (device const uint16_t *)(x[i].qh) + q_offset_h/2;
         device const int8_t  * sc = x[i].scales + is;
         device const half    * dh = &x[i].d;
 
@@ -8828,18 +8842,32 @@ void kernel_mul_mv_q6_K_f32_impl(
         for (short row = 0; row < nr0; ++row) {
             float4 sums = {0.f, 0.f, 0.f, 0.f};
 
-            FOR_UNROLL (short l = 0; l < 4; ++l) {
-                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            FOR_UNROLL (short l = 0; l < 2; ++l) {
+                const uint16_t w1 = q1[l];
+                const uint16_t w2 = q2[l];
+                const uint16_t wh = qh[l];
+
+                // low byte of each word == the even element of the old byte-wise loop
+                const uint8_t a1 = w1 & 0xFF, b1 = w1 >> 8;
+                const uint8_t a2 = w2 & 0xFF, b2 = w2 >> 8;
+                const uint8_t ah = wh & 0xFF, bh = wh >> 8;
+
+                sums[0] += yl[8*l + 0] * ((int8_t)((a1 & 0xF) | ((ah & kmask1) << 4)) - 32);
+                sums[1] += yl[8*l + 1] * ((int8_t)((a2 & 0xF) | ((ah & kmask2) << 2)) - 32);
+                sums[2] += yl[8*l + 2] * ((int8_t)((a1  >> 4) | ((ah & kmask3) << 0)) - 32);
+                sums[3] += yl[8*l + 3] * ((int8_t)((a2  >> 4) | ((ah & kmask4) >> 2)) - 32);
+
+                sums[0] += yl[8*l + 4] * ((int8_t)((b1 & 0xF) | ((bh & kmask1) << 4)) - 32);
+                sums[1] += yl[8*l + 5] * ((int8_t)((b2 & 0xF) | ((bh & kmask2) << 2)) - 32);
+                sums[2] += yl[8*l + 6] * ((int8_t)((b1  >> 4) | ((bh & kmask3) << 0)) - 32);
+                sums[3] += yl[8*l + 7] * ((int8_t)((b2  >> 4) | ((bh & kmask4) >> 2)) - 32);
             }
 
             sumf[row] += dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
 
-            q1 += args.nb01;
-            q2 += args.nb01;
-            qh += args.nb01;
+            q1 += args.nb01/2;
+            q2 += args.nb01/2;
+            qh += args.nb01/2;
             sc += args.nb01;
             dh += args.nb01/2;
         }
