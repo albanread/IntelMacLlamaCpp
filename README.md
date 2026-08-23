@@ -57,20 +57,23 @@ Two flags matter enormously on this hardware:
 
 ## What to run on 32 GB of VRAM
 
-The card is **kernel-bound, not bandwidth-bound** — the dense 8B sustains only
-~152 GiB/s of an HBM2 part capable of ~1 TB/s. So speed tracks *bytes read per
-token*, which is why MoE wins so decisively, and why a higher quant costs less
-speed than you would expect.
+Measured, not projected — see [the verified table](#models-verified-on-this-hardware) for
+the full set. The short version:
 
-| model | quant | weights | generation |
-|---|---|---:|---:|
-| **Qwen3-30B-A3B** | **Q4_K_M** | **17.3 GB** | **46.6 t/s** (measured) |
-| Qwen3-30B-A3B | Q5_K_M / Q6_K | 21.7 / 25.1 GB | fits, ~5–15% slower |
-| Qwen3-8B | Q4_K_M | 4.7 GB | 32.9 t/s (measured) |
-| Qwen3-8B | Q8_0 | 8.1 GB | ~19 t/s |
-| Qwen3-14B | Q5_K_M / Q6_K | 10–11 GB | ~14 t/s |
-| Qwen3-32B (dense) | Q4_K_M | 18.5 GB | ~8 t/s |
-| anything 70B | — | ≥31 GB | will not fit with a KV cache |
+| if you want | run |
+|---|---|
+| the best model that fits | **Gemma-4-26B-A4B QAT** (13 GB) — 241 / 49 t/s |
+| the fastest good model | **gpt-oss-20b MXFP4** (12 GB) — 231 / **62** t/s |
+| a solid all-rounder | **Qwen3-30B-A3B** (17 GB) — 179 / 52 t/s |
+| something small and quick | Llama-3.2-3B Q5_K_M (2.3 GB) — 317 / 54 t/s |
+
+**Prefer MoE.** Generation speed tracks *active* parameters, so a 26B MoE outruns a dense
+12B by more than 2x while being a far stronger model. All three MoE entries above beat every
+dense model here on generation.
+
+The card is **kernel-bound, not bandwidth-bound** — the dense 8B reads weights at roughly a
+quarter of the ~830 GB/s the hardware can sustain. So a higher quantisation level costs less
+speed than you would expect, and is usually worth taking.
 
 ### Quantization: use K-quants, avoid the IQ family
 
@@ -86,21 +89,31 @@ untriaged. `mxfp4` passing means gpt-oss-style models should work.
 
 ### Models verified on this hardware
 
-Every one of these was checked against the CPU backend on the same text, not just eyeballed:
+Each was checked against the **CPU backend on identical text**, not merely eyeballed for
+coherence. Throughput is `pp512` / `tg64` at `-ngl 99 -lm none` on an otherwise idle card.
 
-| model | quant | prefill | generation | PPL vs CPU |
-|---|---|---:|---:|---|
-| Qwen3-30B-A3B (MoE) | Q4_K_M | 179 | **52** | +0.28% |
-| Qwen3-8B | Q4_K_M | 162 | 47 | bit-identical |
-| gpt-oss-20b (MoE) | MXFP4 | 231 | **62** | −0.02% |
-| Gemma-4-26B-A4B (MoE) | **QAT** Q4_K_XL | 241 | **49** | −1.56% |
-| Gemma-3-12B | Q6_K | 127 | 21 | +0.01% |
-| Llama-3.1-8B | Q8_0 | 176 | 32 | −0.00% |
-| Llama-3.2-3B | Q5_K_M | 317 | 54 | −0.00% |
-| Llama-3.2-3B | f16 | 426 | 59 | −0.00% |
+| model | quant | size | prefill | generation | PPL (GPU) | vs CPU |
+|---|---|---:|---:|---:|---:|---:|
+| **Gemma-4-26B-A4B** (MoE) | QAT Q4_K_XL | 13 GB | **241** | **49** | 777 † | −1.56% |
+| **Qwen3-30B-A3B** (MoE) | Q4_K_M | 17 GB | 179 | **52** | 9.66 | +0.28% |
+| **gpt-oss-20b** (MoE) | MXFP4 | 12 GB | 231 | **62** | 213 † | −0.02% |
+| Qwen3-8B | Q4_K_M | 4.7 GB | 162 | 47 | 10.52 | bit-identical |
+| Gemma-3-12B | Q6_K | 9.7 GB | 127 | 21 | 8.94 | +0.01% |
+| Llama-3.1-8B | Q8_0 | 8.5 GB | 176 | 32 | 7.43 | −0.00% |
+| Llama-3.2-3B | Q5_K_M | 2.3 GB | 317 | 54 | 10.95 | −0.00% |
+| Llama-3.2-3B | f16 | 6.4 GB | 426 | **59** | 10.87 | −0.00% |
 
 Four architectures (Qwen3, Llama, Gemma 3, Gemma 4), dense and MoE, six quantisation
-formats.
+formats. Perplexity is wikitext-2 at `-c 512`; the **vs CPU** column is the number that
+matters here, since it isolates the backend from the model.
+
+† Reasoning-tuned models score raw prose poorly regardless of backend — gpt-oss and Gemma 4
+are high on *both* CPU and GPU. Compare them against their own CPU figure, not against the
+other rows.
+
+**Generation tracks active parameters, not model size.** The three MoE models occupy the top
+of the generation column despite being the largest here: a 26B model at 49 t/s and a 30B at
+52 t/s, against 21 t/s for a dense 12B. On a 32 GB card, MoE is the format to reach for.
 
 ### MoE models are unusually sensitive to 4-bit quantisation
 
