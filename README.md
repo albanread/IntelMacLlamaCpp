@@ -11,8 +11,8 @@ Verified on a **Mac Pro (2019, MacPro7,1)** running **macOS 26.3.1**:
 
 | model | prefill (pp512) | generation (tg64) |
 |---|---:|---:|
-| **Qwen3-30B-A3B** (MoE, Q4_K_M, 17.3 GB) | **175.4 t/s** | **49.9 t/s** |
-| **Qwen3-8B** (dense, Q4_K_M, 4.7 GB) | 162.7 t/s | 42.0 t/s |
+| **Qwen3-30B-A3B** (MoE, Q4_K_M, 17.3 GB) | **179.2 t/s** | **51.9 t/s** |
+| **Qwen3-8B** (dense, Q4_K_M, 4.7 GB) | 162.4 t/s | 46.9 t/s |
 | either model on upstream llama.cpp | *garbage output* | *garbage output* |
 
 Yes — a **30B model generates faster than an 8B** here. Qwen3-30B-A3B activates only
@@ -83,6 +83,27 @@ the suite's k = 256):
 24/24), and `iq2_xs` **hangs the GPU**, which on this hardware takes the desktop
 session down with it (see the warning below). The rest of the IQ family is
 untriaged. `mxfp4` passing means gpt-oss-style models should work.
+
+### Models verified on this hardware
+
+Every one of these was checked against the CPU backend on the same text, not just eyeballed:
+
+| model | quant | prefill | generation | PPL vs CPU |
+|---|---|---:|---:|---|
+| Qwen3-30B-A3B (MoE) | Q4_K_M | 179 | **52** | +0.28% |
+| Qwen3-8B | Q4_K_M | 162 | 47 | bit-identical |
+| gpt-oss-20b (MoE) | MXFP4 | 231 | **62** | −0.02% |
+| Gemma-4-26B-A4B (MoE) | Q4_K_M | 214 | 39 | see note |
+| Gemma-3-12B | Q6_K | 127 | 21 | +0.01% |
+| Llama-3.1-8B | Q8_0 | 176 | 32 | −0.00% |
+| Llama-3.2-3B | Q5_K_M | 317 | 54 | −0.00% |
+| Llama-3.2-3B | f16 | 426 | 59 | −0.00% |
+
+Four architectures (Qwen3, Llama, Gemma 3, Gemma 4), dense and MoE, six quantisation
+formats. Note on Gemma 4: it scores wikitext at a perplexity of ~17000 **on the CPU
+backend too**, so perplexity is not a usable instrument for it on that corpus — it appears
+to require its chat template. Validated instead by token-exact greedy comparison, where
+GPU and CPU outputs are identical.
 
 ### Just use `-ngl 99`
 
@@ -443,6 +464,42 @@ keeps its stock value.
 The constants are keyed on the probed wave width rather than changed outright, so Apple GPUs
 are unaffected: `N_SIMDWIDTH` is injected when the shader library is compiled, and the host
 selects the matching variant from `simd_width`.
+
+### Load width: 16-bit reads in q5_K and q6_K (+37% on Q6_K models)
+
+After the `nr0` tuning above, q4_K reached 44% of the card's bandwidth but q5_K was still
+at 11% and q6_K at 25%. The cause was not arithmetic and not launch parameters.
+
+**The diagnostic that settled it:** stripping almost all the arithmetic out of the q5_K
+inner loop, while leaving every memory access in place, made it **2.5% faster**. A kernel
+that does not care whether you remove its maths is not ALU-bound. Comparing against q4_K,
+which reaches 2.7x its bandwidth, showed the real difference:
+
+| | reads quants as | loads per 8 quants |
+|---|---|---:|
+| q4_K | `uint16_t` | 4 |
+| q5_K, q6_K | `uint8_t` | **8** |
+
+Twice the memory transactions at half the width. Both kernels now read 16 bits at a time
+and split the bytes in registers, which the block layouts permit — q5_K has `qh` at offset
+16 and `qs` at 48 in a 176-byte block, q6_K has `ql` at 0 and `qh` at 128 in a 210-byte
+block, so every cast is 2-byte aligned.
+
+| | before | after |
+|---|---:|---:|
+| q5_K | 139 | **206 GB/s** (1.48x) |
+| q6_K | 208 | **328 GB/s** (1.58x) |
+
+Generation, end to end:
+
+| model | before | after |
+|---|---:|---:|
+| **Gemma-3-12B Q6_K** | 15.0 | **20.6 t/s** (1.37x) |
+| Llama-3.2-3B Q5_K_M | 44.7 | **54.4 t/s** |
+| Qwen3-8B Q4_K_M | 42.0 | **46.9 t/s** |
+
+Perplexity is bit-identical before and after (Gemma-3-12B 8.9436, Llama-3.2-3B 10.9549).
+`q2_K` and `q3_K` already used 16-bit loads and were not affected.
 
 ### The one that mattered, and what is left
 
