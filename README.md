@@ -11,8 +11,8 @@ Verified on a **Mac Pro (2019, MacPro7,1)** running **macOS 26.3.1**:
 
 | model | prefill (pp512) | generation (tg64) |
 |---|---:|---:|
-| **Qwen3-30B-A3B** (MoE, Q4_K_M, 17.3 GB) | **179.2 t/s** | **46.4 t/s** |
-| **Qwen3-8B** (dense, Q4_K_M, 4.7 GB) | 162.9 t/s | 33.2 t/s |
+| **Qwen3-30B-A3B** (MoE, Q4_K_M, 17.3 GB) | **175.4 t/s** | **49.9 t/s** |
+| **Qwen3-8B** (dense, Q4_K_M, 4.7 GB) | 162.7 t/s | 42.0 t/s |
 | either model on upstream llama.cpp | *garbage output* | *garbage output* |
 
 Yes — a **30B model generates faster than an 8B** here. Qwen3-30B-A3B activates only
@@ -233,8 +233,13 @@ that barrier; **the AMD macOS driver does not enforce it between concurrently di
 kernels.**
 
 **Fix:** concurrent dispatch is now restricted to Apple-family GPUs. Measured cost on the
-Vega II is **~4.6% generation throughput** (32.4 vs 34.0 t/s) — a very cheap correctness fix.
+Vega II is **~6% generation throughput** (42.0 vs 44.8 t/s) — a cheap correctness fix.
 Override with `GGML_METAL_CONCURRENCY_ENABLE=1` if you want to experiment.
+
+**Retested after every kernel fix**, in case the nondeterminism had really been the broken
+wave64 kernels rather than the barrier: it was not. With concurrency forced on, three
+identical greedy runs still produce three *different* garbage outputs while the serial path is
+correct. The barrier behaviour is the driver's, and the serialisation stays.
 
 An attempt to keep concurrency by ending and restarting the encoder at each dependency point
 made things *worse* — restarting discards encoder state that multi-dispatch ops rely on. That
@@ -378,10 +383,10 @@ in large steps with hysteresis so you pay that cost rarely rather than every tur
 
 | KV type | prefill | generation |
 |---|---:|---:|
-| f16 (default) | 48.1 | **33.1** |
-| q8_0 | 45.4 | **14.1** |
+| f16 (default) | 162.9 | **41.8** |
+| q8_0 | 114.0 | **16.2** |
 
-Generation drops **57%**. Dequantizing K/V inside attention costs far more than the
+Generation drops **61%**, and prefill 30% with it. Dequantizing K/V inside attention costs far more than the
 bandwidth it saves, because the flash-attention kernels that normally absorb that cost are
 disabled on any non-Apple7 GPU.
 
@@ -401,6 +406,44 @@ checking K drafted tokens costs about as much as generating one, which requires 
 **mat-mul**. This card only has the mat-**vec** fallback, so verifying ~4 tokens costs
 roughly 4×, and you pay for the draft model on top.
 
+### Mat-vec: rows per simdgroup (+27% generation)
+
+Prefill was the obvious target; generation turned out to have a cheaper win. Measuring each
+kernel against the card's ~830 GB/s copy ceiling located it immediately — and it was **not** a
+bandwidth problem:
+
+| kernel | GB/s | % of ceiling |
+|---|---:|---:|
+| f32 / f16 | 675 / 654 | **~80%** |
+| q4_0 | 428 | 52% |
+| q4_K | 219 | 26% |
+| q5_K | 90 | **11%** |
+
+The float kernels nearly saturate the card, so the memory path was fine; only the *quantised*
+kernels were starved. The cause is `N_R0_*` — how many src0 rows one simdgroup accumulates,
+which sets how far the activation-vector load is amortised. The stock values are tuned for
+32-wide Apple waves, and the correlation is already visible in the stock numbers above:
+q4_0 has `nr0=4`, q4_K has `2`, q5_K has `1`.
+
+Raising it to 8 (measured optimum) gives:
+
+| | q4_K | q5_K | q6_K | q2_K | q3_K | q5_0 |
+|---|---:|---:|---:|---:|---:|---:|
+| stock | 219 | 90 | 191 | 123 | 92 | 344 |
+| tuned | **369** | **139** | **208** | **216** | **129** | **395** |
+
+**Generation: 33.2 -> 42.0 t/s on the dense 8B, 46.4 -> 49.9 on the MoE.** Prefill unchanged.
+Perplexity is bit-identical (10.5168) — this redistributes work without touching arithmetic.
+
+Two findings worth keeping. **`nsg` is irrelevant** — 1, 2 and 4 simdgroups give 369/368/368
+GB/s, so `nr0` is the entire effect. And **`nr0` is non-monotonic**: 8 is optimal, 16 and 32
+are both worse as register pressure outweighs the amortisation. `q8_0` regressed at 8 and
+keeps its stock value.
+
+The constants are keyed on the probed wave width rather than changed outright, so Apple GPUs
+are unaffected: `N_SIMDWIDTH` is injected when the shader library is compiled, and the host
+selects the matching variant from `simd_width`.
+
 ### The one that mattered, and what is left
 
 Every item above traced back to `has_simdgroup_mm` being gated on `MTLGPUFamilyApple7`. That
@@ -408,7 +451,20 @@ is now addressed for `MUL_MAT` by [`kernel_mul_mm_w64`](#5-no-mat-mul-at-all): p
 from 48.4 to 162.9 t/s on the dense 8B, and the GPU now beats the CPU at prompt processing
 instead of losing to it.
 
-Both `MUL_MAT` and `MUL_MAT_ID` now use it, so dense and MoE prefill are both covered.
+Both `MUL_MAT` and `MUL_MAT_ID` now use it, so dense and MoE prefill are both covered, and
+the mat-vec tuning above lifted generation by 27%. Where the card stands now:
+
+| | dense 8B | MoE 30B-A3B |
+|---|---:|---:|
+| prefill | 48 -> **163 t/s** | 88 -> **175 t/s** |
+| generation | 33 -> **42 t/s** | 46 -> **50 t/s** |
+
+**The remaining ~2x in generation is a memory access pattern, not a tuning constant.** q4_K now
+reaches 369 GB/s — 44% of the ceiling, up from 26% — but the float kernels still get ~80%. A
+K-quant super-block scatters its quants, high bits and packed scales across 144 bytes, and
+eight threads read different fields of it; f16 reads contiguous `half4x4`. Closing that means
+loading blocks cooperatively before dequantising, which is a kernel rewrite rather than a
+constant change.
 
 **Speculative decoding is still a loss, and now we know why for certain.** It was retested
 after the mat-mul landed and remains ~40% slower. The cause is not draft quality (acceptance
@@ -417,12 +473,12 @@ barely improves at the batch sizes speculation produces:
 
 | batch | 1 | 4 | 8 | 32 | 128 |
 |---|---:|---:|---:|---:|---:|
-| relative throughput | 1.00x | 1.13x | 1.22x | 2.99x | 4.88x |
+| relative throughput | 1.00x | **0.92x** | 0.98x | 2.42x | 3.93x |
 
-Verifying a 3-token draft costs nearly three single-token passes, so the draft model is pure
-overhead. Batching only becomes cheap above ~32. Making that region efficient means improving
-the *mat-vec* kernels, which still run at roughly 16% of the card's memory bandwidth — the
-largest remaining piece of unclaimed performance here.
+Verifying a 3-token draft costs *more* than three single-token passes, so the draft model is
+pure overhead twice over. Batching only becomes cheap above ~32. Note this got **worse** after
+the mat-vec tuning below: single-token decode sped up 27% while batch-4 did not, widening the
+gap that makes speculation unprofitable.
 
 ## ⚠️ Do not run the full `test-backend-ops` suite on this hardware
 
@@ -476,10 +532,13 @@ ADD/MUL/SCALE/CPY/CONT/GLU/DIV        all FAIL=0
   audited for wave64). This is what triggered the WindowServer kill.
 - **`DSV4_HC_PRE/POST/COMB` fail** (DeepSeek-V4 hybrid-context ops, ERR ≈ 0.4–1.1). Not on
   any path used here.
-- **Generation is untouched** by the mat-mul work, as expected — decoding one token at a time
-  is genuinely a mat-vec problem, and those kernels still achieve only ~16% of the card's
-  memory bandwidth. Improving them would speed up generation *and* make speculative decoding
-  viable, which currently loses because small-batch throughput is nearly flat.
+- **Quantised mat-vec still leaves ~2x on the table.** After tuning, q4_K reaches 44% of the
+  card's bandwidth against ~80% for the f16 kernel. The gap is the K-quant super-block access
+  pattern, not the launch parameters, so closing it means restructuring the kernel to load
+  blocks cooperatively before dequantising.
+- **Speculative decoding cannot be rescued by tuning.** Throughput at batch 4 is now *below*
+  batch 1 (0.92x), because the mat-vec tuning sped up single-token decode without helping
+  small batches. Verifying a draft costs more than decoding it.
 - Nothing here is tested on Apple Silicon. The changes are written to be no-ops there — the
   probe returns 32 and concurrency stays enabled — but that is unverified.
 
