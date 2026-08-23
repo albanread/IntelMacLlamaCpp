@@ -93,17 +93,38 @@ Every one of these was checked against the CPU backend on the same text, not jus
 | Qwen3-30B-A3B (MoE) | Q4_K_M | 179 | **52** | +0.28% |
 | Qwen3-8B | Q4_K_M | 162 | 47 | bit-identical |
 | gpt-oss-20b (MoE) | MXFP4 | 231 | **62** | −0.02% |
-| Gemma-4-26B-A4B (MoE) | Q4_K_M | 214 | 39 | see note |
+| Gemma-4-26B-A4B (MoE) | **QAT** Q4_K_XL | 241 | **49** | −1.56% |
 | Gemma-3-12B | Q6_K | 127 | 21 | +0.01% |
 | Llama-3.1-8B | Q8_0 | 176 | 32 | −0.00% |
 | Llama-3.2-3B | Q5_K_M | 317 | 54 | −0.00% |
 | Llama-3.2-3B | f16 | 426 | 59 | −0.00% |
 
 Four architectures (Qwen3, Llama, Gemma 3, Gemma 4), dense and MoE, six quantisation
-formats. Note on Gemma 4: it scores wikitext at a perplexity of ~17000 **on the CPU
-backend too**, so perplexity is not a usable instrument for it on that corpus — it appears
-to require its chat template. Validated instead by token-exact greedy comparison, where
-GPU and CPU outputs are identical.
+formats.
+
+### MoE models are unusually sensitive to 4-bit quantisation
+
+Worth its own heading because it cost real time to diagnose. Two Gemma-4-26B-A4B builds
+from the same publisher, same corpus, same settings:
+
+| build | size | prefill | generation | perplexity |
+|---|---:|---:|---:|---:|
+| `UD-Q4_K_M` | 16 GB | 214 | 39 t/s | **16097** |
+| `qat-UD-Q4_K_XL` | 13 GB | 241 | **49 t/s** | **777** |
+
+A 21x difference in perplexity between two 4-bit quantisations of the same model — and the
+QAT build is *smaller and faster* as well. Nothing similar happens with the dense models
+here, where quantisation choice moves perplexity by fractions of a percent.
+
+The likely reason is structural: an MoE router is a small tensor making a **discrete**
+decision about which experts fire. Quantisation error there does not degrade an output
+slightly, it changes which weights are used at all. Dense models have no equivalent
+pressure point.
+
+**Practical rule: for MoE models prefer a QAT build, or go up a quantisation level.** And
+if an MoE model scores far worse than you expect, suspect the quantisation before
+suspecting the backend — the bad build also showed an alarming +11% GPU-vs-CPU perplexity
+gap that vanished (to −1.56%) with the QAT weights.
 
 ### Just use `-ngl 99`
 
