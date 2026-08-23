@@ -11,15 +11,13 @@ Verified on a **Mac Pro (2019, MacPro7,1)** running **macOS 26.3.1**:
 
 | model | prefill (pp512) | generation (tg64) |
 |---|---:|---:|
-| **Qwen3-30B-A3B** (MoE, Q4_K_M, 17.3 GB) | **126.8 t/s** | **46.3 t/s** |
-| **Qwen3-8B** (dense, Q4_K_M, 4.7 GB) | **162.9 t/s** | 32.1 t/s |
+| **Qwen3-30B-A3B** (MoE, Q4_K_M, 17.3 GB) | **179.2 t/s** | **46.4 t/s** |
+| **Qwen3-8B** (dense, Q4_K_M, 4.7 GB) | 162.9 t/s | 33.2 t/s |
 | either model on upstream llama.cpp | *garbage output* | *garbage output* |
 
 Yes — a **30B model generates faster than an 8B** here. Qwen3-30B-A3B activates only
 ~3B parameters (8 of 128 experts) per token, so it is both quicker *and* far more
-capable. It is the model to run on this hardware. (The 8B now leads on *prefill*, because
-its dense weights get the full benefit of the wave64 mat-mul while the MoE's expert layers
-do not yet — see below.) Verified correct against the CPU
+capable. It is the model to run on this hardware, and now leads on prefill too. Verified correct against the CPU
 backend, routing included (see [Is it actually right?](#is-it-actually-right)).
 
 Upstream's README is preserved as [README.upstream.md](README.upstream.md).
@@ -283,8 +281,37 @@ so the 64-wide wavefront is simply 64 independent lanes:
 | tg32 | 33.3 | 32.1 (unchanged — generation is still mat-vec) |
 
 **~2.67 TFLOP/s, about 19% of the card's fp32 peak** — a 3.4x improvement, and the first time
-the GPU beats the 24-thread Xeon at prompt processing. Qwen3-30B-A3B gains 1.44x
-(88.3 -> 126.8); the rest of its prefill sits in `MUL_MAT_ID`, still on the old path.
+the GPU beats the 24-thread Xeon at prompt processing (93.9 t/s).
+
+The same kernel is applied to MoE expert layers as `kernel_mul_mm_id_w64`, where A is the
+expert's weight matrix and the B rows are gathered through the id map:
+
+| Qwen3-30B-A3B-Q4_K_M | before | after |
+|---|---:|---:|
+| pp512 | 88.4 | **179.2** |
+| pp2048 | 76.4 | **172.2** |
+| tg32 | 46.3 | 46.4 (unchanged) |
+
+**Prefill in one line: 48 -> 163 t/s dense (3.4x), 88 -> 179 t/s MoE (2.0x).** Generation is
+untouched by design — decoding one token at a time is genuinely a mat-vec problem.
+
+### A compiler bug worth knowing about
+
+The MoE kernel was wrong at first, and the cause is worth recording because anyone writing
+Metal kernels for these GPUs can hit it. **Multiplying a `uint64_t` stride by a `short` index
+is miscompiled by AMD's Metal compiler** — the short lands in the high word:
+
+```
+args.nb12 * i12          // i12 is short, value 128
+  -> 4398046511104       // == nb12 << 32, not nb12*128 == 131072
+args.nb12 * (int)i12     // correct
+```
+
+The B pointer therefore landed far outside the buffer and the tile multiplied uninitialised
+memory. The symptom was bizarre and initially looked like a tiling bug: output was wrong from
+**exactly token 128 onwards**, independent of matrix size, expert count and tile geometry —
+128 being where a short index first pushes the miscompiled product past anything the buffer
+covers. Use `int` for any index that multiplies a stride.
 
 Verified rather than assumed: `MUL_MAT` passes **2129/2163**, all 34 failures being
 pre-existing `iq2_xxs` breakage on the mat-vec path and none on the mat-mul path; perplexity
@@ -381,13 +408,21 @@ is now addressed for `MUL_MAT` by [`kernel_mul_mm_w64`](#5-no-mat-mul-at-all): p
 from 48.4 to 162.9 t/s on the dense 8B, and the GPU now beats the CPU at prompt processing
 instead of losing to it.
 
-**Still open — `MUL_MAT_ID`.** MoE expert layers take a separate code path that is still
-gated the same way, which is why Qwen3-30B-A3B gained only 1.44x where the dense model gained
-3.4x. Extending the same register-tiled approach to `mul_mm_id` is the obvious next win.
+Both `MUL_MAT` and `MUL_MAT_ID` now use it, so dense and MoE prefill are both covered.
 
-**Worth revisiting — speculative decoding.** It was measured as a 39% *loss* here, but the
-cause was verification cost, not draft quality (acceptance was 0.65, mean length 2.95). Now
-that batched mat-mul exists, that arithmetic may have changed. It has not been re-measured.
+**Speculative decoding is still a loss, and now we know why for certain.** It was retested
+after the mat-mul landed and remains ~40% slower. The cause is not draft quality (acceptance
+0.60-0.65, mean accepted length ~2.8) and not the absence of mat-mul. It is that throughput
+barely improves at the batch sizes speculation produces:
+
+| batch | 1 | 4 | 8 | 32 | 128 |
+|---|---:|---:|---:|---:|---:|
+| relative throughput | 1.00x | 1.13x | 1.22x | 2.99x | 4.88x |
+
+Verifying a 3-token draft costs nearly three single-token passes, so the draft model is pure
+overhead. Batching only becomes cheap above ~32. Making that region efficient means improving
+the *mat-vec* kernels, which still run at roughly 16% of the card's memory bandwidth — the
+largest remaining piece of unclaimed performance here.
 
 ## ⚠️ Do not run the full `test-backend-ops` suite on this hardware
 
@@ -429,7 +464,8 @@ ADD/MUL/SCALE/CPY/CONT/GLU/DIV        all FAIL=0
 | `GGML_METAL_CONCURRENCY_ENABLE` | force concurrent dispatch on non-Apple GPUs (**produces wrong results here**) |
 | `GGML_METAL_NO_ZEROCOPY` | force staged copies in `set_tensor`/`get_tensor` (debugging) |
 | `GGML_METAL_BARRIER_RESTART_ENABLE` | barrier via encoder restart instead of `memoryBarrierWithScope:` (experimental) |
-| `GGML_METAL_MM_W64_DISABLE` | disable the wave64 mat-mul and fall back to mat-vec prefill (for A/B measurement) |
+| `GGML_METAL_MM_W64_DISABLE` | disable the wave64 mat-mul (dense and MoE) and fall back to mat-vec prefill, for A/B measurement |
+| `GGML_METAL_MM_MIN` / `GGML_METAL_MM_ID_MIN` | batch-size thresholds above which the mat-mul kernels are used (defaults 8 / 32) |
 
 ---
 
@@ -440,12 +476,10 @@ ADD/MUL/SCALE/CPY/CONT/GLU/DIV        all FAIL=0
   audited for wave64). This is what triggered the WindowServer kill.
 - **`DSV4_HC_PRE/POST/COMB` fail** (DeepSeek-V4 hybrid-context ops, ERR ≈ 0.4–1.1). Not on
   any path used here.
-- **MoE prefill is still on the mat-vec path.** `ggml-metal-ops.cpp` gates the expert
-  mat-*mul* on `has_simdgroup_mm`, so `mul_mv_id` is always used. Generation is unaffected
-  (mat-vec is the right kernel for one token), but it caps MoE prefill gains at 1.44x versus
-  3.4x for dense. Extending `kernel_mul_mm_w64` to `mul_mm_id` is the next obvious win.
 - **Generation is untouched** by the mat-mul work, as expected — decoding one token at a time
-  is genuinely a mat-vec problem. Making that faster is a different exercise.
+  is genuinely a mat-vec problem, and those kernels still achieve only ~16% of the card's
+  memory bandwidth. Improving them would speed up generation *and* make speculative decoding
+  viable, which currently loses because small-batch throughput is nearly flat.
 - Nothing here is tested on Apple Silicon. The changes are written to be no-ops there — the
   probe returns 32 and concurrency stays enabled — but that is unverified.
 
