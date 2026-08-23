@@ -815,6 +815,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// the mat-vec kernels pick nr0 by wave width (see the note in ggml-metal-impl.h);
+// the host must choose the same value the shader was compiled with
+#define GGML_METAL_NR0(lib, t) (GGML_METAL_NW(lib) == 64 ? N_R0_##t##_W64 : N_R0_##t##_W32)
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -865,22 +869,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         case GGML_TYPE_Q4_0:
             {
                 nsg = N_SG_Q4_0;
-                nr0 = N_R0_Q4_0;
+                nr0 = GGML_METAL_NR0(lib, Q4_0);
             } break;
         case GGML_TYPE_Q4_1:
             {
                 nsg = N_SG_Q4_1;
-                nr0 = N_R0_Q4_1;
+                nr0 = GGML_METAL_NR0(lib, Q4_1);
             } break;
         case GGML_TYPE_Q5_0:
             {
                 nsg = N_SG_Q5_0;
-                nr0 = N_R0_Q5_0;
+                nr0 = GGML_METAL_NR0(lib, Q5_0);
             } break;
         case GGML_TYPE_Q5_1:
             {
                 nsg = N_SG_Q5_1;
-                nr0 = N_R0_Q5_1;
+                nr0 = GGML_METAL_NR0(lib, Q5_1);
             } break;
         case GGML_TYPE_Q8_0:
             {
@@ -897,27 +901,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         case GGML_TYPE_Q2_K:
             {
                 nsg = N_SG_Q2_K;
-                nr0 = N_R0_Q2_K;
+                nr0 = GGML_METAL_NR0(lib, Q2_K);
             } break;
         case GGML_TYPE_Q3_K:
             {
                 nsg = N_SG_Q3_K;
-                nr0 = N_R0_Q3_K;
+                nr0 = GGML_METAL_NR0(lib, Q3_K);
             } break;
         case GGML_TYPE_Q4_K:
             {
                 nsg = N_SG_Q4_K;
-                nr0 = N_R0_Q4_K;
+                nr0 = GGML_METAL_NR0(lib, Q4_K);
             } break;
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
-                nr0 = N_R0_Q5_K;
+                nr0 = GGML_METAL_NR0(lib, Q5_K);
             } break;
         case GGML_TYPE_Q6_K:
             {
                 nsg = N_SG_Q6_K;
-                nr0 = N_R0_Q6_K;
+                nr0 = GGML_METAL_NR0(lib, Q6_K);
             } break;
         case GGML_TYPE_IQ2_XXS:
             {
@@ -1105,22 +1109,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         case GGML_TYPE_Q4_0:
             {
                 nsg = N_SG_Q4_0;
-                nr0 = N_R0_Q4_0;
+                nr0 = GGML_METAL_NR0(lib, Q4_0);
             } break;
         case GGML_TYPE_Q4_1:
             {
                 nsg = N_SG_Q4_1;
-                nr0 = N_R0_Q4_1;
+                nr0 = GGML_METAL_NR0(lib, Q4_1);
             } break;
         case GGML_TYPE_Q5_0:
             {
                 nsg = N_SG_Q5_0;
-                nr0 = N_R0_Q5_0;
+                nr0 = GGML_METAL_NR0(lib, Q5_0);
             } break;
         case GGML_TYPE_Q5_1:
             {
                 nsg = N_SG_Q5_1;
-                nr0 = N_R0_Q5_1;
+                nr0 = GGML_METAL_NR0(lib, Q5_1);
             } break;
         case GGML_TYPE_Q8_0:
             {
@@ -1137,27 +1141,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         case GGML_TYPE_Q2_K:
             {
                 nsg = N_SG_Q2_K;
-                nr0 = N_R0_Q2_K;
+                nr0 = GGML_METAL_NR0(lib, Q2_K);
             } break;
         case GGML_TYPE_Q3_K:
             {
                 nsg = N_SG_Q3_K;
-                nr0 = N_R0_Q3_K;
+                nr0 = GGML_METAL_NR0(lib, Q3_K);
             } break;
         case GGML_TYPE_Q4_K:
             {
                 nsg = N_SG_Q4_K;
-                nr0 = N_R0_Q4_K;
+                nr0 = GGML_METAL_NR0(lib, Q4_K);
             } break;
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
-                nr0 = N_R0_Q5_K;
+                nr0 = GGML_METAL_NR0(lib, Q5_K);
             } break;
         case GGML_TYPE_Q6_K:
             {
                 nsg = N_SG_Q6_K;
-                nr0 = N_R0_Q6_K;
+                nr0 = GGML_METAL_NR0(lib, Q6_K);
             } break;
         case GGML_TYPE_IQ2_XXS:
             {

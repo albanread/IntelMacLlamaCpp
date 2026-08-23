@@ -21,22 +21,71 @@
 //
 // TODO: for optimal performance, become function of the device and work size
 
+// Rows per simdgroup for the mat-vec kernels.
+//
+// The stock values are tuned for 32-wide Apple GPUs. On a 64-wide wavefront the
+// activation-vector load is amortised over far too few rows, and the kernels run at a
+// fraction of achievable bandwidth. Measured on a Radeon Pro Vega II (830 GB/s copy):
+//
+//     q4_K   219 -> 369 GB/s     q2_K   123 -> 216 GB/s
+//     q5_K    90 -> 139 GB/s     q3_K    92 -> 129 GB/s
+//     q6_K   191 -> 208 GB/s     q5_0   344 -> 395 GB/s
+//
+// nsg makes no measurable difference; nr0 is the whole effect, and it is non-monotonic
+// (16 and 32 are both worse than 8 as register pressure starts to cost more than the
+// amortisation gains). q8_0 regressed at 8 and keeps its stock value.
+//
+// N_SIMDWIDTH is injected when the shader library is compiled, so the device side picks
+// the right variant automatically; the host selects the matching value from simd_width.
+
 #define N_R0_Q1_0 8
 #define N_SG_Q1_0 2
 
 #define N_R0_Q2_0 8
 #define N_SG_Q2_0 2
 
-#define N_R0_Q4_0 4
+#define N_R0_Q4_0_W32 4
+#define N_R0_Q4_0_W64 8
+#if defined(__METAL_VERSION__)
+#  if N_SIMDWIDTH == 64
+#    define N_R0_Q4_0 N_R0_Q4_0_W64
+#  else
+#    define N_R0_Q4_0 N_R0_Q4_0_W32
+#  endif
+#endif
 #define N_SG_Q4_0 2
 
-#define N_R0_Q4_1 4
+#define N_R0_Q4_1_W32 4
+#define N_R0_Q4_1_W64 8
+#if defined(__METAL_VERSION__)
+#  if N_SIMDWIDTH == 64
+#    define N_R0_Q4_1 N_R0_Q4_1_W64
+#  else
+#    define N_R0_Q4_1 N_R0_Q4_1_W32
+#  endif
+#endif
 #define N_SG_Q4_1 2
 
-#define N_R0_Q5_0 4
+#define N_R0_Q5_0_W32 4
+#define N_R0_Q5_0_W64 8
+#if defined(__METAL_VERSION__)
+#  if N_SIMDWIDTH == 64
+#    define N_R0_Q5_0 N_R0_Q5_0_W64
+#  else
+#    define N_R0_Q5_0 N_R0_Q5_0_W32
+#  endif
+#endif
 #define N_SG_Q5_0 2
 
-#define N_R0_Q5_1 4
+#define N_R0_Q5_1_W32 4
+#define N_R0_Q5_1_W64 8
+#if defined(__METAL_VERSION__)
+#  if N_SIMDWIDTH == 64
+#    define N_R0_Q5_1 N_R0_Q5_1_W64
+#  else
+#    define N_R0_Q5_1 N_R0_Q5_1_W32
+#  endif
+#endif
 #define N_SG_Q5_1 2
 
 #define N_R0_Q8_0 2
@@ -45,19 +94,59 @@
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
-#define N_R0_Q2_K 4
+#define N_R0_Q2_K_W32 4
+#define N_R0_Q2_K_W64 8
+#if defined(__METAL_VERSION__)
+#  if N_SIMDWIDTH == 64
+#    define N_R0_Q2_K N_R0_Q2_K_W64
+#  else
+#    define N_R0_Q2_K N_R0_Q2_K_W32
+#  endif
+#endif
 #define N_SG_Q2_K 2
 
-#define N_R0_Q3_K 2
+#define N_R0_Q3_K_W32 2
+#define N_R0_Q3_K_W64 8
+#if defined(__METAL_VERSION__)
+#  if N_SIMDWIDTH == 64
+#    define N_R0_Q3_K N_R0_Q3_K_W64
+#  else
+#    define N_R0_Q3_K N_R0_Q3_K_W32
+#  endif
+#endif
 #define N_SG_Q3_K 2
 
-#define N_R0_Q4_K 2
+#define N_R0_Q4_K_W32 2
+#define N_R0_Q4_K_W64 8
+#if defined(__METAL_VERSION__)
+#  if N_SIMDWIDTH == 64
+#    define N_R0_Q4_K N_R0_Q4_K_W64
+#  else
+#    define N_R0_Q4_K N_R0_Q4_K_W32
+#  endif
+#endif
 #define N_SG_Q4_K 2
 
-#define N_R0_Q5_K 1
+#define N_R0_Q5_K_W32 1
+#define N_R0_Q5_K_W64 8
+#if defined(__METAL_VERSION__)
+#  if N_SIMDWIDTH == 64
+#    define N_R0_Q5_K N_R0_Q5_K_W64
+#  else
+#    define N_R0_Q5_K N_R0_Q5_K_W32
+#  endif
+#endif
 #define N_SG_Q5_K 2
 
-#define N_R0_Q6_K 2
+#define N_R0_Q6_K_W32 2
+#define N_R0_Q6_K_W64 8
+#if defined(__METAL_VERSION__)
+#  if N_SIMDWIDTH == 64
+#    define N_R0_Q6_K N_R0_Q6_K_W64
+#  else
+#    define N_R0_Q6_K N_R0_Q6_K_W32
+#  endif
+#endif
 #define N_SG_Q6_K 2
 
 #define N_R0_IQ1_S 4
