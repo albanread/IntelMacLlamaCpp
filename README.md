@@ -62,10 +62,49 @@ the full set. The short version:
 
 | if you want | run |
 |---|---|
-| the best model that fits | **Gemma-4-26B-A4B QAT** (13 GB) — 241 / 49 t/s |
+| the best quality that fits | **Qwen3-30B-A3B Q6_K** (23 GB) — 208 / 47 t/s |
+| the best model per GB | **Gemma-4-26B-A4B QAT** (13 GB) — 241 / 49 t/s |
 | the fastest good model | **gpt-oss-20b MXFP4** (12 GB) — 231 / **62** t/s |
-| a solid all-rounder | **Qwen3-30B-A3B** (17 GB) — 179 / 52 t/s |
 | something small and quick | Llama-3.2-3B Q5_K_M (2.3 GB) — 317 / 54 t/s |
+
+### The VRAM budget
+
+Metal reports `recommendedMaxWorkingSetSize = 34343 MB`, which is exactly 32 GiB, and
+`hasUnifiedMemory = false`. Because the 580X drives the display, the Vega II pays no
+framebuffer tax — all 32 GiB is available to compute.
+
+Three things share it: **weights + KV cache + ~1.5 GiB of compute buffer.** Using the
+bits-per-weight our own files imply (Qwen3-30B-A3B is 17.3 GiB for 30.5B = 4.54 bpw), that
+leaves roughly 29.5 GiB for weights:
+
+| quant | GiB per 1B params | largest that loads |
+|---|---:|---:|
+| Q2_K | 0.35 | ~85B |
+| Q4_K_M | 0.57 | **~52B** |
+| Q5_K_M | 0.68 | ~44B |
+| Q6_K | 0.80 | ~37B |
+| Q8_0 | 1.00 | ~30B |
+
+Q8_0 of Qwen3-30B is 30.2 GiB and does **not** fit once KV and compute are added — Q6_K at
+23.4 GiB is the largest usable quant of that model here.
+
+**KV cache varies far more than people expect** — a 9x spread across models we run:
+
+| | KiB/token | 32K context |
+|---|---:|---:|
+| gpt-oss-20b | 48 | 1.5 GiB |
+| Qwen3-30B-A3B | 96 | 3.0 GiB |
+| Gemma-3-12B | 384 | 12 GiB * |
+| Gemma-4-26B-A4B | 420 | 13 GiB * |
+
+\* both Gemmas use sliding-window attention (`swa=1024`), so only the global layers hold full
+context and the real allocation is a fraction of that — but a Gemma-shaped model at long
+context eats headroom a Qwen-shaped one does not.
+
+**Budget ~50B total at Q4_K_M, and make it MoE.** MoE is the only structure where largest and
+fastest coincide, since generation cost tracks active parameters. Two constraints, though:
+`Q2_K` wrecks an MoE router (see below), and the IQ family — the usual way to squeeze 70B into
+32 GB — is broken on this card, so that escape hatch is not available.
 
 **Prefer MoE.** Generation speed tracks *active* parameters, so a 26B MoE outruns a dense
 12B by more than 2x while being a far stronger model. All three MoE entries above beat every
@@ -92,24 +131,35 @@ untriaged. `mxfp4` passing means gpt-oss-style models should work.
 Each was checked against the **CPU backend on identical text**, not merely eyeballed for
 coherence. Throughput is `pp512` / `tg64` at `-ngl 99 -lm none` on an otherwise idle card.
 
-| model | quant | size | prefill | generation | PPL (GPU) | vs CPU |
-|---|---|---:|---:|---:|---:|---:|
-| **Gemma-4-26B-A4B** (MoE) | QAT Q4_K_XL | 13 GB | **241** | **49** | 777 † | −1.56% |
-| **Qwen3-30B-A3B** (MoE) | Q4_K_M | 17 GB | 179 | **52** | 9.66 | +0.28% |
-| **gpt-oss-20b** (MoE) | MXFP4 | 12 GB | 231 | **62** | 213 † | −0.02% |
-| Qwen3-8B | Q4_K_M | 4.7 GB | 162 | 47 | 10.52 | bit-identical |
-| Gemma-3-12B | Q6_K | 9.7 GB | 127 | 21 | 8.94 | +0.01% |
-| Llama-3.1-8B | Q8_0 | 8.5 GB | 176 | 32 | 7.43 | −0.00% |
-| Llama-3.2-3B | Q5_K_M | 2.3 GB | 317 | 54 | 10.95 | −0.00% |
-| Llama-3.2-3B | f16 | 6.4 GB | 426 | **59** | 10.87 | −0.00% |
+| model | quant | size | prefill | generation | PPL (GPU) | n | vs CPU |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **Gemma-4-26B-A4B** (MoE) | QAT Q4_K_XL | 13 GB | **241** | **49** | 777 † | 24 | −1.56% |
+| **Qwen3-30B-A3B** (MoE) | **Q6_K** | 23 GB | **208** | 47 | **8.28** | 24 | +0.42% |
+| **Qwen3-30B-A3B** (MoE) | Q4_K_M | 17 GB | 177 | **51** | 8.66 | 24 | +0.28% |
+| **gpt-oss-20b** (MoE) | MXFP4 | 12 GB | 231 | **62** | 213 † | 80 | −0.02% |
+| Qwen3-8B | Q4_K_M | 4.7 GB | 162 | 47 | 10.52 | 80 | bit-identical |
+| Gemma-3-12B | Q6_K | 9.7 GB | 129 | 20 | 8.94 | 24 | +0.01% |
+| Llama-3.1-8B | Q8_0 | 8.5 GB | 176 | 32 | 7.43 | 24 | −0.00% |
+| Llama-3.2-3B | Q5_K_M | 2.3 GB | 317 | 54 | 10.95 | 24 | −0.00% |
+| Llama-3.2-3B | f16 | 6.4 GB | 426 | **59** | 10.87 | 24 | −0.00% |
 
-Four architectures (Qwen3, Llama, Gemma 3, Gemma 4), dense and MoE, six quantisation
-formats. Perplexity is wikitext-2 at `-c 512`; the **vs CPU** column is the number that
-matters here, since it isolates the backend from the model.
+Four architectures (Qwen3, Llama, Gemma 3, Gemma 4), dense and MoE, seven quantisation
+formats. Perplexity is wikitext-2 at `-c 512` over **n** chunks — absolute values are only
+comparable between rows with the same **n**, so compare within a model, not down the column.
+The **vs CPU** column is the one that matters here, since it isolates the backend from the
+model.
 
 † Reasoning-tuned models score raw prose poorly regardless of backend — gpt-oss and Gemma 4
 are high on *both* CPU and GPU. Compare them against their own CPU figure, not against the
 other rows.
+
+**A bigger quant is not simply slower.** Q6_K of Qwen3-30B is 35% larger than Q4_K_M, yet
+its **prefill is 17% faster** (208 vs 177 t/s) and its perplexity 4.3% better, for only 8%
+off generation (47 vs 51 t/s). q4_K packs its scales as 6-bit fields that must be unpacked
+per sub-block; q6_K uses plain 8-bit scales. On a card whose K-quant kernels are *not*
+ALU-bound, reading more bytes and doing less work per byte is the better trade. **If the
+VRAM is free, take the higher quant** — the usual size-versus-speed intuition is inverted
+here for prefill.
 
 **Generation tracks active parameters, not model size.** The three MoE models occupy the top
 of the generation column despite being the largest here: a 26B model at 49 t/s and a 30B at
