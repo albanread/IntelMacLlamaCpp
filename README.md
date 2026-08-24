@@ -67,6 +67,18 @@ ever go upstream, or be used in a permissively-licensed or commercial product. I
 an app, use his. If you need patches you can relicense, or an explanation of *why* the
 Metal backend fails on these cards, this is that.
 
+### Where this fork goes next
+
+Knowing the gap is better than suspecting one. Generation is already level, so the work is
+not diffuse — it is localised in `mul_mm`, and 29% of fp32 peak is now a demonstrated number
+rather than a hope. That is a far more useful position than we were in this morning.
+
+So this fork continues, on its own track. Independently, from the hardware — the ISA, the
+instruction counts, the measurements — and deliberately **not** by reading ToshLLM's
+implementation. That is partly a licence necessity, since anything derived from GPL-3.0 code
+could never stay MIT or go upstream. But it is also simply how the work has been done so far,
+and the reason the two projects agreeing on so much means anything at all.
+
 ## Quick start
 
 ```bash
