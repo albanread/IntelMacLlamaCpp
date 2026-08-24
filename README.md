@@ -20,6 +20,22 @@ Yes — a **30B model generates faster than an 8B** here. Qwen3-30B-A3B activate
 capable. It is the model to run on this hardware, and now leads on prefill too. Verified correct against the CPU
 backend, routing included (see [Is it actually right?](#is-it-actually-right)).
 
+### Where this came from
+
+This fork is a side effect of a different project: porting the Mojo compiler's GPU backend to
+emit Apple AIR bitcode for this same card. That work had already mapped how a Radeon Pro
+Vega II differs from the Apple GPUs Metal is designed around — 64-lane wavefronts, no
+`simdgroup_matrix`, resource descriptors instead of generic pointers, and a Metal compiler
+with miscompiles of its own. A 32-lane intrinsic applied to a 64-lane wavefront was found and
+fixed in that compiler backend before llama.cpp was ever opened.
+
+The provenance shows in the diagnosis. Several of the defects documented below are compiler
+bugs rather than kernel bugs, and one is an instruction-selection fault in Apple's Metal
+compiler for AMD — not the sort of thing you go looking for if you arrived by tuning matmuls.
+The accumulated hardware notes live in
+**[AIR_on_AMD.md](https://github.com/albanread/MojoMacX64/blob/main/AIR_on_AMD.md)**, a field
+guide to targeting AIR on AMD GPUs that is useful independently of this fork.
+
 Upstream's README is preserved as [README.upstream.md](README.upstream.md).
 
 If you want a finished application rather than a patch set, see
