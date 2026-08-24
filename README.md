@@ -24,8 +24,8 @@ Upstream's README is preserved as [README.upstream.md](README.upstream.md).
 
 If you want a finished application rather than a patch set, see
 **[ToshLLM](https://github.com/engeldlgado/toshllm)** — a more complete port of the same
-idea, with a fuller comparison and the independence note
-[further down](#related-work-toshllm-and-a-note-on-independence).
+idea, with a fuller comparison
+[further down](#related-work-toshllm).
 
 Forked from upstream `e85caa81ea2b65797396018c179b87ad61fa38ab` (2026-08-22).
 
@@ -698,7 +698,7 @@ ADD/MUL/SCALE/CPY/CONT/GLU/DIV        all FAIL=0
 
 ---
 
-## Related work: ToshLLM, and a note on independence
+## Related work: ToshLLM
 
 **[ToshLLM](https://github.com/engeldlgado/toshllm)**, by Engelbert Delgado, is a parallel
 port of the same idea that has been running longer and covers more ground. If you own an
@@ -718,16 +718,6 @@ And it is faster. On identical hardware, the same model file and the same flags:
 | **ToshLLM v0.85.7** | **615 t/s** | **53 t/s** |
 
 Generation is level; his prompt processing is **3.5x** ours. Credit where it is due.
-
-### On independence
-
-For the avoidance of doubt: this work was done without knowledge of ToshLLM, which we found
-on 2026-08-24. Every kernel change here was committed and pushed publicly before that — this
-repository has been public since 2026-08-22 13:20 UTC, the wave64 mat-mul landed the same day
-at 18:13, and the mat-vec and load-width work on 2026-08-23. The commit and push timestamps
-are on GitHub and are not ours to edit. **No code has been copied from ToshLLM into this
-repository**, and none can be: ToshLLM is GPL-3.0 and this fork is MIT, which also means
-nothing here can travel the other way into his tree.
 
 ### Where this fork goes next
 
