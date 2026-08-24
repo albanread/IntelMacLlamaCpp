@@ -26,6 +26,47 @@ Forked from upstream `e85caa81ea2b65797396018c179b87ad61fa38ab` (2026-08-22).
 
 ---
 
+## If you just want the best experience: use ToshLLM
+
+**[ToshLLM](https://github.com/engeldlgado/toshllm)**, by Engelbert Delgado, has been doing
+this longer and does it more thoroughly. If you own an Intel Mac with an AMD GPU and you
+want working local LLMs rather than a study of why they were broken, **go there first.**
+
+It is a polished native macOS app, not a patch set: model management, a real chat UI, and a
+far wider range of supported hardware than this one machine. Technically it is ahead in
+places this fork does not reach at all — flash attention on AMD, multi-GPU dispatch
+(relevant if you have a Vega II *Duo*), a quantised KV cache, and proper mmap residency.
+
+And it is faster. On identical hardware, the same model file and the same flags:
+
+| Qwen3-30B-A3B Q4_K_M, Vega II | prefill | generation |
+|---|---:|---:|
+| this fork | 177 t/s | 51 t/s |
+| **ToshLLM v0.85.7** | **615 t/s** | **53 t/s** |
+
+Generation is level; his prompt processing is **3.5x** ours. Credit where it is due.
+
+### On independence
+
+The two projects arrived at many of the same fixes — wave64 reductions and mat-vec, a
+register-tiled GEMM without `simdgroup_matrix`, its MoE variant, 16-bit quant loads,
+rows-per-simdgroup tuning, device selection, a buffer-allocation guard. That convergence is
+not borrowing in either direction; it is what happens when two people meet the same hardware.
+
+For the avoidance of doubt: this work was done without knowledge of ToshLLM, which we found
+on 2026-08-24. Every kernel change here was committed and pushed publicly before that — this
+repository has been public since 2026-08-22 13:20 UTC, the wave64 mat-mul landed the same day
+at 18:13, and the mat-vec and load-width work on 2026-08-23. The commit and push timestamps
+are on GitHub and are not ours to edit. **No code has been copied from ToshLLM into this
+repository**, and none can be: ToshLLM is GPL-3.0 and this fork is MIT, which also means
+nothing here can travel the other way into his tree.
+
+That licence difference is the one real reason this fork might still be useful to somebody.
+llama.cpp is MIT and cannot accept GPL-3.0 patches, so of the two ports only this one could
+ever go upstream, or be used in a permissively-licensed or commercial product. If you need
+an app, use his. If you need patches you can relicense, or an explanation of *why* the
+Metal backend fails on these cards, this is that.
+
 ## Quick start
 
 ```bash
