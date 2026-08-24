@@ -134,8 +134,8 @@ coherence. Throughput is `pp512` / `tg64` at `-ngl 99 -lm none` on an otherwise 
 | model | quant | size | prefill | generation | PPL (GPU) | n | vs CPU |
 |---|---|---:|---:|---:|---:|---:|---:|
 | **Gemma-4-26B-A4B** (MoE) | QAT Q4_K_XL | 13 GB | **241** | **49** | 777 † | 24 | −1.56% |
-| **Qwen3-30B-A3B** (MoE) | **Q6_K** | 23 GB | **208** | 47 | **8.28** | 24 | +0.42% |
-| **Qwen3-30B-A3B** (MoE) | Q4_K_M | 17 GB | 177 | **51** | 8.66 | 24 | +0.28% |
+| **Qwen3-30B-A3B** (MoE) | **Q6_K** | 23 GB | **208** | 47 | **9.20** | 80 | +0.42% |
+| **Qwen3-30B-A3B** (MoE) | Q4_K_M | 17 GB | 177 | **51** | 9.66 | 80 | +0.28% |
 | **gpt-oss-20b** (MoE) | MXFP4 | 12 GB | 231 | **62** | 213 † | 80 | −0.02% |
 | Qwen3-8B | Q4_K_M | 4.7 GB | 162 | 47 | 10.52 | 80 | bit-identical |
 | Gemma-3-12B | Q6_K | 9.7 GB | 129 | 20 | 8.94 | 24 | +0.01% |
@@ -154,8 +154,10 @@ are high on *both* CPU and GPU. Compare them against their own CPU figure, not a
 other rows.
 
 **A bigger quant is not simply slower.** Q6_K of Qwen3-30B is 35% larger than Q4_K_M, yet
-its **prefill is 17% faster** (208 vs 177 t/s) and its perplexity 4.3% better, for only 8%
-off generation (47 vs 51 t/s). q4_K packs its scales as 6-bit fields that must be unpacked
+its **prefill is 17% faster** (208 vs 177 t/s) and its perplexity **4.8% better**, for only 8%
+off generation (47 vs 51 t/s). The quality gain is not marginal: scoring both on identical
+text and comparing per chunk gives a paired **t = 9.8** over 80 chunks, with Q6_K ahead on
+85% of them. q4_K packs its scales as 6-bit fields that must be unpacked
 per sub-block; q6_K uses plain 8-bit scales. On a card whose K-quant kernels are *not*
 ALU-bound, reading more bytes and doing less work per byte is the better trade. **If the
 VRAM is free, take the higher quant** — the usual size-versus-speed intuition is inverted
@@ -165,7 +167,7 @@ here for prefill.
 of the generation column despite being the largest here: a 26B model at 49 t/s and a 30B at
 52 t/s, against 21 t/s for a dense 12B. On a 32 GB card, MoE is the format to reach for.
 
-### MoE models are unusually sensitive to 4-bit quantisation
+### Two 4-bit builds of the same model can differ by 21x
 
 Worth its own heading because it cost real time to diagnose. Two Gemma-4-26B-A4B builds
 from the same publisher, same corpus, same settings:
@@ -175,18 +177,24 @@ from the same publisher, same corpus, same settings:
 | `UD-Q4_K_M` | 16 GB | 214 | 39 t/s | **16097** |
 | `qat-UD-Q4_K_XL` | 13 GB | 241 | **49 t/s** | **777** |
 
-A 21x difference in perplexity between two 4-bit quantisations of the same model — and the
-QAT build is *smaller and faster* as well. Nothing similar happens with the dense models
-here, where quantisation choice moves perplexity by fractions of a percent.
+A 21x difference between two 4-bit quantisations of the same model — and the QAT build is
+*smaller and faster* as well.
 
-The likely reason is structural: an MoE router is a small tensor making a **discrete**
-decision about which experts fire. Quantisation error there does not degrade an output
-slightly, it changes which weights are used at all. Dense models have no equivalent
-pressure point.
+**We do not have a confirmed explanation, and the obvious one is wrong.** Inspecting the
+tensors of both files: the router (`ffn_gate_inp`) is `F32` in *both*, as it is in every
+GGUF we have — these quantisers never quantise it. Worse for the tidy story, the build that
+scores 21x worse carries **higher** precision nearly everywhere (`Q8_0` attention, output
+and embeddings, against `Q4_0` in the good build). Precision is not the variable separating
+them.
 
-**Practical rule: for MoE models prefer a QAT build, or go up a quantisation level.** And
-if an MoE model scores far worse than you expect, suspect the quantisation before
-suspecting the backend — the bad build also showed an alarming +11% GPU-vs-CPU perplexity
+Note also that 777 is itself a poor score — Gemma-3-12B manages 8.94 on the same corpus.
+*Both* Gemma 4 builds are anomalous; one is merely catastrophic. Since the CPU backend
+shows the same thing, this is not our Metal code, and it may not be a quantisation story at
+all so much as a question about Gemma 4 support upstream.
+
+**Practical rule, which is empirical and survives regardless of the mechanism: prefer a QAT
+build, and measure perplexity before trusting any build.** If a model scores far worse than
+you expect, suspect the weights before suspecting the backend — the bad build also showed an alarming +11% GPU-vs-CPU perplexity
 gap that vanished (to −1.56%) with the QAT weights.
 
 ### Just use `-ngl 99`
