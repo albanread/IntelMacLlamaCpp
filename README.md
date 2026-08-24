@@ -721,11 +721,6 @@ Generation is level; his prompt processing is **3.5x** ours. Credit where it is 
 
 ### On independence
 
-The two projects arrived at many of the same fixes — wave64 reductions and mat-vec, a
-register-tiled GEMM without `simdgroup_matrix`, its MoE variant, 16-bit quant loads,
-rows-per-simdgroup tuning, device selection, a buffer-allocation guard. That convergence is
-not borrowing in either direction; it is what happens when two people meet the same hardware.
-
 For the avoidance of doubt: this work was done without knowledge of ToshLLM, which we found
 on 2026-08-24. Every kernel change here was committed and pushed publicly before that — this
 repository has been public since 2026-08-22 13:20 UTC, the wave64 mat-mul landed the same day
@@ -742,9 +737,8 @@ rather than a hope. That is a far more useful position than we were in this morn
 
 So this fork continues, on its own track. Independently, from the hardware — the ISA, the
 instruction counts, the measurements — and deliberately **not** by reading ToshLLM's
-implementation. That is partly a licence necessity — GPL-3.0 and MIT
-code cannot be mixed in either direction. But it is also simply how the work has been done so
-far, and the reason the two projects agreeing on so much means anything at all.
+implementation. That is partly a licence necessity, since GPL-3.0 and MIT code cannot be
+mixed in either direction, and partly just how the work has been done so far.
 
 ## License
 
