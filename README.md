@@ -734,12 +734,6 @@ are on GitHub and are not ours to edit. **No code has been copied from ToshLLM i
 repository**, and none can be: ToshLLM is GPL-3.0 and this fork is MIT, which also means
 nothing here can travel the other way into his tree.
 
-That licence difference is the one real reason this fork might still be useful to somebody.
-llama.cpp is MIT and cannot accept GPL-3.0 patches, so of the two ports only this one could
-ever go upstream, or be used in a permissively-licensed or commercial product. If you need
-an app, use his. If you need patches you can relicense, or an explanation of *why* the
-Metal backend fails on these cards, this is that.
-
 ### Where this fork goes next
 
 Knowing the gap is better than suspecting one. Generation is already level, so the work is
@@ -748,9 +742,9 @@ rather than a hope. That is a far more useful position than we were in this morn
 
 So this fork continues, on its own track. Independently, from the hardware — the ISA, the
 instruction counts, the measurements — and deliberately **not** by reading ToshLLM's
-implementation. That is partly a licence necessity, since anything derived from GPL-3.0 code
-could never stay MIT or go upstream. But it is also simply how the work has been done so far,
-and the reason the two projects agreeing on so much means anything at all.
+implementation. That is partly a licence necessity — GPL-3.0 and MIT
+code cannot be mixed in either direction. But it is also simply how the work has been done so
+far, and the reason the two projects agreeing on so much means anything at all.
 
 ## License
 
