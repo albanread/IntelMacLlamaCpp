@@ -129,6 +129,7 @@ int main(int argc, char ** argv) {
     if (const char * v = getenv("MOE_B_VRAM")) { base.b_vram = atof(v); }
     base.gb_per_slot = getenv("MOE_GB_PER_SLOT") ? atof(getenv("MOE_GB_PER_SLOT")) : 0.0;
     base.cpu_budget  = getenv("MOE_CPU_BUDGET")  ? atof(getenv("MOE_CPU_BUDGET"))  : 1.0;
+    base.ms_per_crossing = getenv("MOE_MS_CROSSING") ? atof(getenv("MOE_MS_CROSSING")) : 0.737;
     base.vram_gb       = getenv("MOE_VRAM_GB")       ? atof(getenv("MOE_VRAM_GB"))       : 0.0;
     base.vram_reserved = getenv("MOE_VRAM_RESERVED") ? atof(getenv("MOE_VRAM_RESERVED")) : 0.0;
 
@@ -136,6 +137,7 @@ int main(int argc, char ** argv) {
     printf("events  : %zu (token,layer) routing decisions\n", t.recs.size());
     printf("model   : %d layers x %d experts = %zu slots\n", t.n_layer, t.n_expert, n_slots);
     printf("profile : %s (%zu slots)\n", argc > 2 ? argv[2] : "none", profile.size());
+    printf("crossing : %.3f ms fixed per step that sends work to the CPU\n", base.ms_per_crossing);
     printf("bandwidth: PCIe %.1f  host %.1f (x%.2f budget = %.1f usable)  vram %.1f GB/s",
            base.b_pcie, base.b_host, base.cpu_budget, base.b_host * base.cpu_budget, base.b_vram);
     if (base.gb_per_slot > 0.0) { printf("   slot %.4f GB", base.gb_per_slot); }

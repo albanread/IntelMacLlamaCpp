@@ -86,6 +86,12 @@ struct config {
     // off the critical path.
     bool admit_cpu_misses = true;
 
+    // MEASURED: sending any of a layer's work to the CPU splits the graph and
+    // costs this much before a single byte moves, independent of how much work
+    // it is. Fitted across two architectures and two quant families,
+    // R^2 = 0.99. A PCIe fetch does NOT pay it - the compute stays on the GPU.
+    double ms_per_crossing = 0.737;
+
     // adaptive balancing smoothing
     double ewma = 0.05;
 };
@@ -104,6 +110,7 @@ struct stats {
     uint64_t fetched    = 0;
     uint64_t cpu_done   = 0;
     uint64_t evictions  = 0;
+    uint64_t crossings  = 0;   // steps that sent any work to the CPU
 
     double gb_pcie = 0.0;
     double gb_cpu  = 0.0;
@@ -286,9 +293,14 @@ private:
 
         const double t_vram = cfg_.b_vram > 0 ? gb_vram / cfg_.b_vram : 0.0;
         const double t_pcie = bp > 0 ? gb_pcie / bp : 0.0;
-        // the CPU only gets what the transfer leaves it
+        // the CPU only gets what the transfer leaves it, and pays the fixed
+        // graph-split cost the moment it is given anything at all
         const double b_res  = std::max(1.0, bh - bp);
-        const double t_cpu  = gb_cpu / b_res;
+        double t_cpu = gb_cpu / b_res;
+        if (!d.cpu.empty()) {
+            t_cpu += cfg_.ms_per_crossing / 1000.0;
+            st_.crossings++;
+        }
 
         st_.t_vram += t_vram;
         st_.t_pcie += t_pcie;
