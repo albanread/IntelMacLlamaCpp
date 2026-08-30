@@ -2935,6 +2935,20 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                         ggml_metal_encoder_set_buffer(enc, bid_pairs, 3);
                         ggml_metal_encoder_set_buffer(enc, bid_nadm,  4);
                         ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_ids, 1, 1, 256, 1, 1);
+
+                        // diagnostic: repeat the dispatch to price per-dispatch
+                        // overhead. Each extra pass is a no-op once n_admit is 0.
+                        static const int extra = getenv("GGML_METAL_MOE_EXTRA_DISPATCH")
+                                               ? atoi(getenv("GGML_METAL_MOE_EXTRA_DISPATCH")) : 0;
+                        for (int r = 0; r < extra; ++r) {
+                            ggml_metal_encoder_set_pipeline(enc, pa);
+                            ggml_metal_encoder_set_bytes (enc, &aa, sizeof(aa), 0);
+                            ggml_metal_encoder_set_buffer(enc, bid_src0,  1);
+                            ggml_metal_encoder_set_buffer(enc, bid_pool,  2);
+                            ggml_metal_encoder_set_buffer(enc, bid_pairs, 3);
+                            ggml_metal_encoder_set_buffer(enc, bid_nadm,  4);
+                            ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_ids, 1, 1, 256, 1, 1);
+                        }
                     }
 
                     // 3. read weights from the pool, indexed by slot
