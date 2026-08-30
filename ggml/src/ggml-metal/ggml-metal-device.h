@@ -343,6 +343,7 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id_at(ggml_metal_buffer_t buf, size_t offs);
 
 #ifdef __cplusplus
 }

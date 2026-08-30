@@ -12,9 +12,117 @@
 #include "ggml-metal-device.h"
 
 #include <cassert>
+#include <mutex>
+#include <unordered_map>
 #include <algorithm>
 #include <limits>
 #include <cmath>
+
+// ---------------------------------------------------------------------------
+// MoE expert paging
+//
+// When a model's expert weights do not fit in VRAM they end up in a host-visible
+// buffer, and the GPU reads them across PCIe every token - which is why mmap'd
+// models crawl. This keeps a pool of VRAM slots and pages the routed experts in,
+// so the hot working set is read at VRAM speed instead.
+//
+// Enabled with GGML_METAL_MOE_POOL_MB. Off by default.
+//
+// Residency is decided by kernel_moe_resolve on device: the routing ids come from
+// an argsort in the same graph, so a host readback would flush the pipeline once
+// per MoE layer.
+// ---------------------------------------------------------------------------
+
+struct ggml_metal_moe_page {
+    ggml_metal_buffer_t pool = nullptr;   // private: n_slots * nb02
+    ggml_metal_buffer_t meta = nullptr;   // shared: tables + scratch
+    int    n_slots  = 0;
+    int    n_expert = 0;
+    size_t nb02     = 0;
+    size_t max_ids  = 0;
+
+    // byte offsets into `meta`
+    size_t off_slot_of_expert = 0;
+    size_t off_expert_of_slot = 0;
+    size_t off_hand           = 0;
+    size_t off_n_admit        = 0;
+    size_t off_out_ids        = 0;
+    size_t off_pairs          = 0;
+};
+
+static size_t ggml_metal_moe_pool_mb() {
+    static size_t mb = SIZE_MAX;
+    if (mb == SIZE_MAX) {
+        const char * v = getenv("GGML_METAL_MOE_POOL_MB");
+        mb = v ? (size_t) atoi(v) : 0;
+    }
+    return mb;
+}
+
+// one pool per expert tensor, keyed by tensor pointer
+static ggml_metal_moe_page * ggml_metal_moe_get(
+        ggml_metal_device_t dev, const ggml_tensor * src0, size_t max_ids) {
+    static std::mutex mutex;
+    static std::unordered_map<const ggml_tensor *, ggml_metal_moe_page *> pages;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto it = pages.find(src0);
+    if (it != pages.end()) {
+        return it->second;
+    }
+
+    const size_t pool_bytes = ggml_metal_moe_pool_mb() * 1024llu * 1024llu;
+    const size_t nb02       = src0->nb[2];
+    const int    n_expert   = (int) src0->ne[2];
+
+    int n_slots = (int) (pool_bytes / nb02);
+    if (n_slots > n_expert) { n_slots = n_expert; }   // no point holding more
+
+    if (n_slots < 1) {
+        pages[src0] = nullptr;
+        return nullptr;
+    }
+
+    auto * p = new ggml_metal_moe_page();
+    p->n_slots  = n_slots;
+    p->n_expert = n_expert;
+    p->nb02     = nb02;
+    p->max_ids  = max_ids;
+
+    p->off_slot_of_expert = 0;
+    p->off_expert_of_slot = p->off_slot_of_expert + sizeof(int32_t)*n_expert;
+    p->off_hand           = p->off_expert_of_slot + sizeof(int32_t)*n_slots;
+    p->off_n_admit        = p->off_hand           + sizeof(int32_t);
+    p->off_out_ids        = p->off_n_admit        + sizeof(int32_t);
+    p->off_pairs          = p->off_out_ids        + sizeof(int32_t)*max_ids;
+
+    const size_t meta_bytes = p->off_pairs + sizeof(int32_t)*2*max_ids;
+
+    p->pool = ggml_metal_buffer_init(dev, (size_t) n_slots * nb02, false);
+    p->meta = ggml_metal_buffer_init(dev, meta_bytes, true);
+
+    if (!p->pool || !p->meta) {
+        GGML_LOG_ERROR("%s: failed to allocate MoE pool for '%s'\n", __func__, src0->name);
+        delete p;
+        pages[src0] = nullptr;
+        return nullptr;
+    }
+
+    // empty residency: nothing mapped, hand at zero
+    int32_t * base = (int32_t *) ggml_metal_buffer_get_base(p->meta);
+    for (int i = 0; i < n_expert; ++i) { base[i] = -1; }
+    for (int i = 0; i < n_slots;  ++i) { base[n_expert + i] = -1; }
+    base[(p->off_hand    )/sizeof(int32_t)] = 0;
+    base[(p->off_n_admit )/sizeof(int32_t)] = 0;
+
+    GGML_LOG_INFO("%s: MoE pool for '%s': %d/%d experts resident (%.1f MiB)\n",
+                  __func__, src0->name, n_slots, n_expert,
+                  (double)(n_slots*nb02)/(1024.0*1024.0));
+
+    pages[src0] = p;
+    return p;
+}
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -2738,12 +2846,87 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             GGML_ASSERT(ne00 >= nsg*nr0);
         }
 
+        // MoE expert paging. If the expert weights are host-resident and a pool
+        // is configured, stage the routed experts into VRAM and rewrite the ids
+        // to slot indices. The matmul kernel is untouched: it already reaches an
+        // expert through the id buffer and nb02, so pointing it at the pool and
+        // substituting the ids is enough.
+        ggml_metal_buffer_id bid_w    = bid_src0;
+        ggml_metal_buffer_id bid_idsq = bid_src2;
+
+        if (ggml_metal_moe_pool_mb() > 0) {
+            const ggml_tensor * w = op->src[0];
+            ggml_backend_buffer_t wbuf = w->view_src ? w->view_src->buffer : w->buffer;
+            ggml_metal_buffer_t   wctx = (ggml_metal_buffer_t) wbuf->context;
+
+            if (ggml_metal_buffer_is_shared(wctx)) {
+                const size_t n_ids = (size_t) ne20*ne21;
+
+                ggml_metal_moe_page * pg = ggml_metal_moe_get(ctx->dev, w, n_ids);
+
+                if (pg && n_ids <= pg->max_ids) {
+                    const ggml_metal_buffer_id bid_soe   = ggml_metal_buffer_get_id_at(pg->meta, pg->off_slot_of_expert);
+                    const ggml_metal_buffer_id bid_eos   = ggml_metal_buffer_get_id_at(pg->meta, pg->off_expert_of_slot);
+                    const ggml_metal_buffer_id bid_hand  = ggml_metal_buffer_get_id_at(pg->meta, pg->off_hand);
+                    const ggml_metal_buffer_id bid_nadm  = ggml_metal_buffer_get_id_at(pg->meta, pg->off_n_admit);
+                    const ggml_metal_buffer_id bid_oids  = ggml_metal_buffer_get_id_at(pg->meta, pg->off_out_ids);
+                    const ggml_metal_buffer_id bid_pairs = ggml_metal_buffer_get_id_at(pg->meta, pg->off_pairs);
+                    const ggml_metal_buffer_id bid_pool  = ggml_metal_buffer_get_id_at(pg->pool, 0);
+
+                    // 1. decide residency on device and emit the admit list
+                    {
+                        ggml_metal_kargs_moe_resolve ra = {
+                            /*.n_ids   =*/ (int32_t) n_ids,
+                            /*.n_slots =*/ (int32_t) pg->n_slots,
+                            /*.n_expert=*/ (int32_t) pg->n_expert,
+                        };
+
+                        auto pr = ggml_metal_library_get_pipeline_moe_resolve(lib);
+
+                        ggml_metal_encoder_set_pipeline(enc, pr);
+                        ggml_metal_encoder_set_bytes (enc, &ra, sizeof(ra), 0);
+                        ggml_metal_encoder_set_buffer(enc, bid_src2,  1);
+                        ggml_metal_encoder_set_buffer(enc, bid_soe,   2);
+                        ggml_metal_encoder_set_buffer(enc, bid_eos,   3);
+                        ggml_metal_encoder_set_buffer(enc, bid_hand,  4);
+                        ggml_metal_encoder_set_buffer(enc, bid_oids,  5);
+                        ggml_metal_encoder_set_buffer(enc, bid_pairs, 6);
+                        ggml_metal_encoder_set_buffer(enc, bid_nadm,  7);
+                        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
+                    }
+
+                    // 2. copy the missing experts into their slots
+                    {
+                        ggml_metal_kargs_moe_admit aa = {
+                            /*.nb02    =*/ (uint64_t) pg->nb02,
+                            /*.n_admit =*/ (int32_t) n_ids,   // unused; device value governs
+                        };
+
+                        auto pa = ggml_metal_library_get_pipeline_moe_admit(lib);
+
+                        ggml_metal_encoder_set_pipeline(enc, pa);
+                        ggml_metal_encoder_set_bytes (enc, &aa, sizeof(aa), 0);
+                        ggml_metal_encoder_set_buffer(enc, bid_src0,  1);
+                        ggml_metal_encoder_set_buffer(enc, bid_pool,  2);
+                        ggml_metal_encoder_set_buffer(enc, bid_pairs, 3);
+                        ggml_metal_encoder_set_buffer(enc, bid_nadm,  4);
+                        ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_ids, 1, 1, 256, 1, 1);
+                    }
+
+                    // 3. read weights from the pool, indexed by slot
+                    args.ne02 = pg->n_slots;
+                    bid_w     = bid_pool;
+                    bid_idsq  = bid_oids;
+                }
+            }
+        }
+
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer(enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer(enc, bid_w,    1);
         ggml_metal_encoder_set_buffer(enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst,  3);
-        ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
+        ggml_metal_encoder_set_buffer(enc, bid_idsq, 4);
 
         const int64_t _ne1 = 1;
         const int64_t ne123 = ne20*ne21;

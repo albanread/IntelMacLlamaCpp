@@ -2185,6 +2185,19 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 }
 
+// buffer id at a raw byte offset. ggml_metal_buffer_get_id() resolves through a
+// tensor's data pointer, which pools we allocate ourselves do not have.
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id_at(ggml_metal_buffer_t buf, size_t offs) {
+    struct ggml_metal_buffer_id res = { nil, 0 };
+
+    if (buf->n_buffers > 0) {
+        res.metal = buf->buffers[0].metal;
+        res.offs  = offs;
+    }
+
+    return res;
+}
+
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
     struct ggml_metal_buffer_id res = { nil, 0 };
 

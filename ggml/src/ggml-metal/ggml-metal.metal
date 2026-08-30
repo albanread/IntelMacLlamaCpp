@@ -12383,12 +12383,15 @@ kernel void kernel_moe_admit(
         device const char  * src   [[buffer(1)]],
         device       char  * pool  [[buffer(2)]],
         device const int   * pairs [[buffer(3)]],   // [expert, slot] x n_admit
+        device const int   * n_admit [[buffer(4)]], // written by kernel_moe_resolve
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
 
+    // how many experts to admit is decided on device, so it cannot be a launch
+    // parameter - dispatch the worst case and let the surplus groups retire
     const int i = (int) tgpig.x;
-    if (i >= args.n_admit) {
+    if (i >= n_admit[0]) {
         return;
     }
 
