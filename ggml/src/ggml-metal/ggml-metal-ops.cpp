@@ -37,8 +37,8 @@
 
 struct ggml_metal_moe_page {
     ggml_metal_buffer_t pool = nullptr;   // private: n_slots * nb02
-    ggml_metal_buffer_t meta = nullptr;   // host-mapped: tables + scratch
-    void *              meta_host = nullptr;
+    ggml_metal_buffer_t meta = nullptr;   // PRIVATE: tables + scratch
+    bool                inited = false;
     int    n_slots  = 0;
     int    n_expert = 0;
     size_t nb02     = 0;
@@ -104,35 +104,20 @@ static ggml_metal_moe_page * ggml_metal_moe_get(
 
     p->pool = ggml_metal_buffer_init(dev, (size_t) n_slots * nb02, false);
 
-    // NOTE: ggml_metal_buffer_init() silently downgrades a shared request to
-    //       private when the device does not support shared buffers - and this
-    //       one does not. Its all_data is then a virtual address, so writing the
-    //       initial tables through get_base() segfaults. Map our own host pages
-    //       instead, which gives a real pointer and a Metal buffer over it.
-    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
-    const size_t meta_aligned = ((meta_bytes + page - 1)/page)*page;
+    // NOTE: the residency table must live in VRAM, not in a host mapping.
+    //       kernel_moe_resolve writes it and the next token's resolve reads it
+    //       back; through a host-mapped buffer those writes are not reliably
+    //       visible on a discrete GPU, so every expert missed every token and
+    //       the pool re-admitted the whole model continuously. Output stayed
+    //       correct, which is why this cost 1.86x instead of showing up as a bug.
+    p->meta = ggml_metal_buffer_init(dev, meta_bytes, false);
 
-    if (posix_memalign(&p->meta_host, page, meta_aligned) != 0) {
-        p->meta_host = nullptr;
-    } else {
-        memset(p->meta_host, 0, meta_aligned);
-        p->meta = ggml_metal_buffer_map(dev, p->meta_host, meta_aligned, meta_aligned);
-    }
-
-    if (!p->pool || !p->meta || !p->meta_host) {
+    if (!p->pool || !p->meta) {
         GGML_LOG_ERROR("%s: failed to allocate MoE pool for '%s'\n", __func__, src0->name);
-        if (p->meta_host) { free(p->meta_host); }
         delete p;
         pages[src0] = nullptr;
         return nullptr;
     }
-
-    // empty residency: nothing mapped, hand at zero
-    int32_t * base = (int32_t *) p->meta_host;
-    for (int i = 0; i < n_expert; ++i) { base[i] = -1; }
-    for (int i = 0; i < n_slots;  ++i) { base[n_expert + i] = -1; }
-    base[(p->off_hand    )/sizeof(int32_t)] = 0;
-    base[(p->off_n_admit )/sizeof(int32_t)] = 0;
 
     GGML_LOG_INFO("%s: MoE pool for '%s': %d/%d experts resident (%.1f MiB)\n",
                   __func__, src0->name, n_slots, n_expert,
@@ -2890,6 +2875,27 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                     const ggml_metal_buffer_id bid_oids  = ggml_metal_buffer_get_id_at(pg->meta, pg->off_out_ids);
                     const ggml_metal_buffer_id bid_pairs = ggml_metal_buffer_get_id_at(pg->meta, pg->off_pairs);
                     const ggml_metal_buffer_id bid_pool  = ggml_metal_buffer_get_id_at(pg->pool, 0);
+
+                    // 0. one-time reset of the residency table, on device
+                    if (!pg->inited) {
+                        ggml_metal_kargs_moe_resolve ia = {
+                            /*.n_ids   =*/ 0,
+                            /*.n_slots =*/ (int32_t) pg->n_slots,
+                            /*.n_expert=*/ (int32_t) pg->n_expert,
+                        };
+
+                        auto pi = ggml_metal_library_get_pipeline_moe_init(lib);
+
+                        ggml_metal_encoder_set_pipeline(enc, pi);
+                        ggml_metal_encoder_set_bytes (enc, &ia, sizeof(ia), 0);
+                        ggml_metal_encoder_set_buffer(enc, bid_soe,  1);
+                        ggml_metal_encoder_set_buffer(enc, bid_eos,  2);
+                        ggml_metal_encoder_set_buffer(enc, bid_hand, 3);
+                        ggml_metal_encoder_set_buffer(enc, bid_nadm, 4);
+                        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 256, 1, 1);
+
+                        pg->inited = true;
+                    }
 
                     // 1. decide residency on device and emit the admit list
                     {

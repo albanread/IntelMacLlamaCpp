@@ -83,6 +83,15 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_init(ggml_metal_library_t lib) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_moe_init");
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_moe_init", "kernel_moe_init", nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_resolve(ggml_metal_library_t lib) {
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_moe_resolve");
     if (!res.pipeline) {

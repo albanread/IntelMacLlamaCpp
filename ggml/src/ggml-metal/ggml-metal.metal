@@ -12469,3 +12469,28 @@ kernel void kernel_moe_resolve(
     hand[0]    = h;
     n_admit[0] = n;
 }
+
+// Reset a residency table. The table lives in VRAM, not host-mapped memory:
+// kernel_moe_resolve writes it and the next token's resolve reads it back, and
+// on a discrete GPU those writes are not reliably visible through a host
+// mapping. Keeping it device-private means it has to be initialised here.
+kernel void kernel_moe_init(
+        constant ggml_metal_kargs_moe_resolve & args,
+        device int * slot_of_expert [[buffer(1)]],
+        device int * expert_of_slot [[buffer(2)]],
+        device int * hand           [[buffer(3)]],
+        device int * n_admit        [[buffer(4)]],
+        uint tpig[[thread_position_in_grid]],
+        uint  ntg[[threads_per_grid]]) {
+
+    for (int i = (int) tpig; i < args.n_expert; i += (int) ntg) {
+        slot_of_expert[i] = -1;
+    }
+    for (int i = (int) tpig; i < args.n_slots; i += (int) ntg) {
+        expert_of_slot[i] = -1;
+    }
+    if (tpig == 0) {
+        hand[0]    = 0;
+        n_admit[0] = 0;
+    }
+}
