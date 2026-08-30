@@ -24,6 +24,11 @@
 struct histo {
     int n_layer  = 0;
     int n_expert = 0;
+    // optional trace sink: counts alone cannot evaluate a dynamic policy, which
+    // needs the ORDER of selections. Records are <u16 layer><u16 k><k x u16 expert>
+    // per (token, layer), preceded by a small header.
+    FILE * trace = nullptr;
+    int64_t trace_tok = 0;
     // counts[il][expert]
     std::vector<std::vector<int64_t>> counts;
     int64_t n_selections = 0;
@@ -77,6 +82,19 @@ static bool moe_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         for (int64_t i = 0; i < k; ++i) { max_id = std::max(max_id, row[i]); }
     }
     h->ensure(il, max_id + 1);
+
+    if (h->trace) {
+        std::vector<uint16_t> rec;
+        rec.reserve(2 + k);
+        for (int64_t j = 0; j < rows; ++j) {
+            const int32_t * row = (const int32_t *) (raw.data() + (size_t) j * nb1);
+            rec.clear();
+            rec.push_back((uint16_t) il);
+            rec.push_back((uint16_t) k);
+            for (int64_t i = 0; i < k; ++i) { rec.push_back((uint16_t) row[i]); }
+            fwrite(rec.data(), sizeof(uint16_t), rec.size(), h->trace);
+        }
+    }
 
     for (int64_t j = 0; j < rows; ++j) {
         const int32_t * row = (const int32_t *) (raw.data() + (size_t) j * nb1);
@@ -134,6 +152,14 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     histo h;
+    if (const char * tp = getenv("MOE_TRACE")) {
+        h.trace = fopen(tp, "wb");
+        if (h.trace) {
+            // header: magic, n_layer and n_expert are patched in at the end
+            const uint32_t magic = 0x454f4d31; // "1MOE"
+            fwrite(&magic, sizeof(magic), 1, h.trace);
+        }
+    }
     params.cb_eval           = moe_cb;
     params.cb_eval_user_data = &h;
     params.warmup            = false;
@@ -264,6 +290,11 @@ int main(int argc, char ** argv) {
         printf("SKEWED - static placement is worth trying; dynamic residency buys more.\n");
     } else {
         printf("NEAR-UNIFORM - static pinning is not worth it; only dynamic residency helps.\n");
+    }
+
+    if (h.trace) {
+        fclose(h.trace);
+        printf("routing trace written to %s\n", getenv("MOE_TRACE"));
     }
 
     llama_backend_free();

@@ -19,6 +19,7 @@ else()
     add_subdirectory(embedding)
     add_subdirectory(eval-callback)
     add_subdirectory(moe-histogram)
+    add_subdirectory(moe-policy)
 
     add_subdirectory(gguf-hash)
     add_subdirectory(gguf)
