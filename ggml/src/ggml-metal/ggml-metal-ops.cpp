@@ -2921,9 +2921,13 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
                     // 2. copy the missing experts into their slots
                     {
+                        // enough threadgroups per slice to fill the card
+                        const int n_chunk = 64;
+
                         ggml_metal_kargs_moe_admit aa = {
                             /*.nb02    =*/ (uint64_t) pg->nb02,
                             /*.n_admit =*/ (int32_t) n_ids,   // unused; device value governs
+                            /*.n_chunk =*/ (int32_t) n_chunk,
                         };
 
                         auto pa = ggml_metal_library_get_pipeline_moe_admit(lib);
@@ -2934,7 +2938,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                         ggml_metal_encoder_set_buffer(enc, bid_pool,  2);
                         ggml_metal_encoder_set_buffer(enc, bid_pairs, 3);
                         ggml_metal_encoder_set_buffer(enc, bid_nadm,  4);
-                        ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_ids, 1, 1, 256, 1, 1);
+                        ggml_metal_encoder_dispatch_threadgroups(enc, n_chunk, (int) n_ids, 1, 256, 1, 1);
 
                         // diagnostic: repeat the dispatch to price per-dispatch
                         // overhead. Each extra pass is a no-op once n_admit is 0.
@@ -2947,7 +2951,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                             ggml_metal_encoder_set_buffer(enc, bid_pool,  2);
                             ggml_metal_encoder_set_buffer(enc, bid_pairs, 3);
                             ggml_metal_encoder_set_buffer(enc, bid_nadm,  4);
-                            ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_ids, 1, 1, 256, 1, 1);
+                            ggml_metal_encoder_dispatch_threadgroups(enc, n_chunk, (int) n_ids, 1, 256, 1, 1);
                         }
                     }
 

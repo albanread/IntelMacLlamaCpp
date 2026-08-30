@@ -1413,6 +1413,7 @@ typedef struct {
 typedef struct {
     uint64_t nb02;      // bytes in one expert slice
     int32_t  n_admit;   // number of (expert, slot) pairs to copy
+    int32_t  n_chunk;   // threadgroups cooperating on each slice
 } ggml_metal_kargs_moe_admit;
 
 #endif // GGML_METAL_IMPL

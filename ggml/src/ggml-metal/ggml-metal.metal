@@ -12390,7 +12390,12 @@ kernel void kernel_moe_admit(
 
     // how many experts to admit is decided on device, so it cannot be a launch
     // parameter - dispatch the worst case and let the surplus groups retire
-    const int i = (int) tgpig.x;
+    // grid is (n_chunk, n_admit): many threadgroups cooperate on ONE slice.
+    // Dispatching one threadgroup per admitted expert leaves a 64-CU card almost
+    // idle - 4 groups of 256 threads copying 4 MiB each is ~1000 serial
+    // iterations per thread, and it dominated everything on a model with 108
+    // expert tensors.
+    const int i = (int) tgpig.y;
     if (i >= n_admit[0]) {
         return;
     }
@@ -12401,9 +12406,10 @@ kernel void kernel_moe_admit(
     device const uint4 * sp = (device const uint4 *) (src  + (uint64_t) e * args.nb02);
     device       uint4 * dp = (device       uint4 *) (pool + (uint64_t) s * args.nb02);
 
-    const uint64_t n16 = args.nb02 / 16;
+    const uint64_t n16    = args.nb02 / 16;
+    const uint64_t stride = (uint64_t) args.n_chunk * ntg.x;
 
-    for (uint64_t k = tpitg.x; k < n16; k += ntg.x) {
+    for (uint64_t k = (uint64_t) tgpig.x * ntg.x + tpitg.x; k < n16; k += stride) {
         dp[k] = sp[k];
     }
 }
