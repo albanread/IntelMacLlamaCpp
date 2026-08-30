@@ -13,6 +13,7 @@
 
 #include "expert_policy.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,7 +24,7 @@
 
 struct trace {
     // one entry per (token, layer): the experts that layer routed to
-    struct rec { uint16_t layer; std::vector<uint16_t> experts; };
+    struct rec { uint32_t token; uint16_t layer; std::vector<uint16_t> experts; };
     std::vector<rec> recs;
     int n_layer  = 0;
     int n_expert = 0;
@@ -34,7 +35,7 @@ static bool load_trace(const char * path, trace & t) {
     if (!f) { fprintf(stderr, "cannot open trace %s\n", path); return false; }
 
     uint32_t magic = 0;
-    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != 0x454f4d31) {
+    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != 0x454f4d32) {
         fprintf(stderr, "%s: bad magic (not a moe trace)\n", path);
         fclose(f);
         return false;
@@ -45,7 +46,10 @@ static bool load_trace(const char * path, trace & t) {
         const uint16_t layer = hdr[0];
         const uint16_t k     = hdr[1];
         if (k == 0 || k > 4096) { break; }
+        uint32_t tok = 0;
+        if (fread(&tok, sizeof(tok), 1, f) != 1) { break; }
         trace::rec r;
+        r.token = tok;
         r.layer = layer;
         r.experts.resize(k);
         if (fread(r.experts.data(), sizeof(uint16_t), k, f) != k) { break; }
@@ -54,6 +58,15 @@ static bool load_trace(const char * path, trace & t) {
         t.recs.push_back(std::move(r));
     }
     fclose(f);
+    // The trace arrives layer-major because the eval callback fires per
+    // (layer, batch). Decode visits every layer of one token before moving on,
+    // so replaying in emission order would show a single layer's working set and
+    // overstate the hit rate badly. Sort into true decode order.
+    std::stable_sort(t.recs.begin(), t.recs.end(),
+        [](const trace::rec & a, const trace::rec & b) {
+            if (a.token != b.token) { return a.token < b.token; }
+            return a.layer < b.layer;
+        });
     return !t.recs.empty();
 }
 
@@ -165,6 +178,21 @@ int main(int argc, char ** argv) {
                    (unsigned long long) s.cpu_done,
                    s.gb_pcie, s.gb_cpu, per_1k);
         }
+    }
+
+    printf("\n=== admission: does promoting CPU-computed experts help? (lru) ===\n");
+    printf("%-22s %9s %10s %12s\n", "admission", "hit rate", "PCIe GB", "exposed ms/1k");
+    for (int admit_cpu = 0; admit_cpu <= 1; ++admit_cpu) {
+        moe::config cfg = base;
+        cfg.policy   = moe::policy_kind::lru;
+        cfg.capacity = (size_t) (n_slots * 0.375);
+        cfg.balance  = moe::balance_kind::residual;
+        cfg.admit_cpu_misses = admit_cpu != 0;
+        const moe::stats s2 = run(t, cfg, profile);
+        const double per_1k = s2.steps ? 1000.0 * s2.t_exposed / (double) s2.steps * 1000.0 : 0.0;
+        printf("%-22s %8.1f%% %10.1f %12.2f\n",
+               admit_cpu ? "fetch + cpu (ours)" : "fetch only (theirs)",
+               100.0 * s2.hit_rate(), s2.gb_pcie, per_1k);
     }
 
     // how the miss split itself matters, at one capacity, on the best policy

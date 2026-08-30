@@ -28,7 +28,8 @@ struct histo {
     // needs the ORDER of selections. Records are <u16 layer><u16 k><k x u16 expert>
     // per (token, layer), preceded by a small header.
     FILE * trace = nullptr;
-    int64_t trace_tok = 0;
+    int64_t tokens_seen = 0;   // global token index of the current batch's first token
+    int64_t batch_base  = 0;
     // counts[il][expert]
     std::vector<std::vector<int64_t>> counts;
     int64_t n_selections = 0;
@@ -84,15 +85,24 @@ static bool moe_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     h->ensure(il, max_id + 1);
 
     if (h->trace) {
-        std::vector<uint16_t> rec;
-        rec.reserve(2 + k);
+        // A new batch starts when we come back round to layer 0. Token indices
+        // must be recorded: the callback fires per (layer, batch), so the trace
+        // is emitted layer-major, while decode visits every layer per token.
+        // Without the index the replay would see one layer's working set at a
+        // time and report a wildly optimistic hit rate.
+        if (il == 0) {
+            h->batch_base   = h->tokens_seen;
+            h->tokens_seen += rows;
+        }
         for (int64_t j = 0; j < rows; ++j) {
             const int32_t * row = (const int32_t *) (raw.data() + (size_t) j * nb1);
-            rec.clear();
-            rec.push_back((uint16_t) il);
-            rec.push_back((uint16_t) k);
-            for (int64_t i = 0; i < k; ++i) { rec.push_back((uint16_t) row[i]); }
-            fwrite(rec.data(), sizeof(uint16_t), rec.size(), h->trace);
+            const uint16_t hdr[2] = { (uint16_t) il, (uint16_t) k };
+            const uint32_t tok    = (uint32_t) (h->batch_base + j);
+            fwrite(hdr, sizeof(uint16_t), 2, h->trace);
+            fwrite(&tok, sizeof(uint32_t), 1, h->trace);
+            std::vector<uint16_t> ex(k);
+            for (int64_t i = 0; i < k; ++i) { ex[i] = (uint16_t) row[i]; }
+            fwrite(ex.data(), sizeof(uint16_t), k, h->trace);
         }
     }
 
@@ -156,7 +166,7 @@ int main(int argc, char ** argv) {
         h.trace = fopen(tp, "wb");
         if (h.trace) {
             // header: magic, n_layer and n_expert are patched in at the end
-            const uint32_t magic = 0x454f4d31; // "1MOE"
+            const uint32_t magic = 0x454f4d32; // "2MOE" - v2 carries token indices
             fwrite(&magic, sizeof(magic), 1, h.trace);
         }
     }

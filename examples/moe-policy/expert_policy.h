@@ -69,6 +69,13 @@ struct config {
 
     double gb_per_slot = 0.0;     // one (layer, expert) pair's weights, in GB
 
+    // Which misses become resident. FreeToken admits only what it transfers,
+    // which is fine when B_P/B_H is high. At our ratio (~0.13) that admits 13%
+    // of misses and the cache never fills, so we also allow promoting experts
+    // the CPU computed - it already has the weights, and the copy can be issued
+    // off the critical path.
+    bool admit_cpu_misses = true;
+
     // adaptive balancing smoothing
     double ewma = 0.05;
 };
@@ -165,6 +172,9 @@ public:
                 admit(miss[i]);          // fetched experts become resident
             } else {
                 d.cpu.push_back(miss[i]);
+                if (cfg_.admit_cpu_misses) {
+                    admit(miss[i]);      // promoted asynchronously, off the critical path
+                }
             }
         }
 
@@ -248,10 +258,13 @@ private:
         st_.gb_pcie += gb_pcie;
         st_.gb_cpu  += gb_cpu;
 
-        const double t_vram = cfg_.b_vram  > 0 ? gb_vram / cfg_.b_vram : 0.0;
-        const double t_pcie = cfg_.b_pcie  > 0 ? gb_pcie / cfg_.b_pcie : 0.0;
+        const double bp = cfg_.balance == balance_kind::adaptive ? b_pcie_ : cfg_.b_pcie;
+        const double bh = cfg_.balance == balance_kind::adaptive ? b_host_ : cfg_.b_host;
+
+        const double t_vram = cfg_.b_vram > 0 ? gb_vram / cfg_.b_vram : 0.0;
+        const double t_pcie = bp > 0 ? gb_pcie / bp : 0.0;
         // the CPU only gets what the transfer leaves it
-        const double b_res  = std::max(1.0, cfg_.b_host - cfg_.b_pcie);
+        const double b_res  = std::max(1.0, bh - bp);
         const double t_cpu  = gb_cpu / b_res;
 
         st_.t_vram += t_vram;
