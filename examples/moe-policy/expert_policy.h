@@ -69,6 +69,16 @@ struct config {
 
     double gb_per_slot = 0.0;     // one (layer, expert) pair's weights, in GB
 
+    // Share of the host we are allowed to consume. The machine has other work to
+    // do, so the CPU expert path does not get the whole memory subsystem. The DMA
+    // reads from host RAM too, and comes out of the same allowance.
+    double cpu_budget = 1.0;      // 1.0 = all of it, 0.5 = half
+
+    // GPU-side utilisation, for reporting: VRAM is shared with the KV cache and
+    // the compute buffer, so resident slots are what is left after those.
+    double vram_gb        = 0.0;  // total usable
+    double vram_reserved  = 0.0;  // KV cache + compute buffer + non-expert weights
+
     // Which misses become resident. FreeToken admits only what it transfers,
     // which is fine when B_P/B_H is high. At our ratio (~0.13) that admits 13%
     // of misses and the cache never fills, so we also allow promoting experts
@@ -107,6 +117,11 @@ struct stats {
     double t_exposed = 0.0;
 
     double hit_rate() const { return requests ? (double) hits / (double) requests : 0.0; }
+
+    // share of the exposed wall time each resource was busy for
+    double util_cpu () const { return t_exposed > 0 ? t_cpu  / t_exposed : 0.0; }
+    double util_pcie() const { return t_exposed > 0 ? t_pcie / t_exposed : 0.0; }
+    double util_gpu () const { return t_exposed > 0 ? t_vram / t_exposed : 0.0; }
 };
 
 class placement {
@@ -220,6 +235,9 @@ private:
         lru_map_[s] = lru_.begin();
     }
 
+    // Host bandwidth we may actually use.
+    double b_host_avail() const { return cfg_.b_host * cfg_.cpu_budget; }
+
     // How many of `m` misses go over PCIe.
     //
     // Under load the DMA reads from host RAM, so it consumes host bandwidth the
@@ -236,7 +254,8 @@ private:
             case balance_kind::residual:
             case balance_kind::adaptive: {
                 const double bp = cfg_.balance == balance_kind::adaptive ? b_pcie_ : cfg_.b_pcie;
-                const double bh = cfg_.balance == balance_kind::adaptive ? b_host_ : cfg_.b_host;
+                const double bh = cfg_.balance == balance_kind::adaptive
+                                    ? b_host_ * cfg_.cpu_budget : b_host_avail();
                 if (bh <= 0.0) { return m; }
                 const double q = (double) m * bp / bh;
                 size_t qi = (size_t) (q + 0.5);
@@ -258,8 +277,12 @@ private:
         st_.gb_pcie += gb_pcie;
         st_.gb_cpu  += gb_cpu;
 
-        const double bp = cfg_.balance == balance_kind::adaptive ? b_pcie_ : cfg_.b_pcie;
-        const double bh = cfg_.balance == balance_kind::adaptive ? b_host_ : cfg_.b_host;
+        // Accounting ALWAYS uses the true bandwidths. The adaptive controller may
+        // estimate whatever it likes, but it must not be billed at its own
+        // estimate - that lets it lower its reported cost by inflating b_pcie_
+        // without anything actually running faster.
+        const double bp = cfg_.b_pcie;
+        const double bh = b_host_avail();
 
         const double t_vram = cfg_.b_vram > 0 ? gb_vram / cfg_.b_vram : 0.0;
         const double t_pcie = bp > 0 ? gb_pcie / bp : 0.0;

@@ -128,14 +128,29 @@ int main(int argc, char ** argv) {
     if (const char * v = getenv("MOE_B_HOST")) { base.b_host = atof(v); }
     if (const char * v = getenv("MOE_B_VRAM")) { base.b_vram = atof(v); }
     base.gb_per_slot = getenv("MOE_GB_PER_SLOT") ? atof(getenv("MOE_GB_PER_SLOT")) : 0.0;
+    base.cpu_budget  = getenv("MOE_CPU_BUDGET")  ? atof(getenv("MOE_CPU_BUDGET"))  : 1.0;
+    base.vram_gb       = getenv("MOE_VRAM_GB")       ? atof(getenv("MOE_VRAM_GB"))       : 0.0;
+    base.vram_reserved = getenv("MOE_VRAM_RESERVED") ? atof(getenv("MOE_VRAM_RESERVED")) : 0.0;
 
     printf("trace   : %s\n", argv[1]);
     printf("events  : %zu (token,layer) routing decisions\n", t.recs.size());
     printf("model   : %d layers x %d experts = %zu slots\n", t.n_layer, t.n_expert, n_slots);
     printf("profile : %s (%zu slots)\n", argc > 2 ? argv[2] : "none", profile.size());
-    printf("bandwidth: PCIe %.1f  host %.1f  vram %.1f GB/s", base.b_pcie, base.b_host, base.b_vram);
+    printf("bandwidth: PCIe %.1f  host %.1f (x%.2f budget = %.1f usable)  vram %.1f GB/s",
+           base.b_pcie, base.b_host, base.cpu_budget, base.b_host * base.cpu_budget, base.b_vram);
     if (base.gb_per_slot > 0.0) { printf("   slot %.4f GB", base.gb_per_slot); }
     printf("\n");
+
+    // If a VRAM budget is given, capacity is not a free parameter: the KV cache,
+    // compute buffer and non-expert weights come out of the same 32 GiB first.
+    if (base.vram_gb > 0.0 && base.gb_per_slot > 0.0) {
+        const double avail = base.vram_gb - base.vram_reserved;
+        const size_t fits  = avail > 0 ? (size_t) (avail / base.gb_per_slot) : 0;
+        printf("vram     : %.1f GB total - %.1f reserved (KV + compute + non-expert) = %.1f for experts\n",
+               base.vram_gb, base.vram_reserved, avail);
+        printf("           -> %zu slots of %zu (%.1f%% capacity)\n",
+               fits, n_slots, 100.0 * (double) fits / (double) n_slots);
+    }
 
     std::vector<double> caps = { 10.0, 25.0, 37.5, 50.0 };
     if (const char * v = getenv("MOE_CAPACITY_PCT")) {
@@ -155,8 +170,9 @@ int main(int argc, char ** argv) {
     for (double cap_pct : caps) {
         const size_t cap = (size_t) (n_slots * cap_pct / 100.0);
         printf("\n=== capacity %.1f%% (%zu of %zu slots) ===\n", cap_pct, cap, n_slots);
-        printf("%-10s %9s %9s %9s %10s %10s %12s\n",
-               "policy", "hit rate", "fetched", "cpu", "PCIe GB", "CPU GB", "exposed ms/1k");
+        printf("%-10s %9s %9s %9s %10s %10s %12s  %5s %5s\n",
+               "policy", "hit rate", "fetched", "cpu", "PCIe GB", "CPU GB", "exposed ms/1k",
+               "gpu%", "cpu%");
 
         for (const auto & pol : policies) {
             if (pol.needs_profile && profile.empty()) { continue; }
@@ -171,12 +187,13 @@ int main(int argc, char ** argv) {
             // exposed time per 1000 routing events, in ms - comparable across runs
             const double per_1k = s.steps ? 1000.0 * s.t_exposed / (double) s.steps * 1000.0 : 0.0;
 
-            printf("%-10s %8.1f%% %9llu %9llu %10.1f %10.1f %12.2f\n",
+            printf("%-10s %8.1f%% %9llu %9llu %10.1f %10.1f %12.2f  %5.0f%% %5.0f%%\n",
                    moe::policy_name(pol.k),
                    100.0 * s.hit_rate(),
                    (unsigned long long) s.fetched,
                    (unsigned long long) s.cpu_done,
-                   s.gb_pcie, s.gb_cpu, per_1k);
+                   s.gb_pcie, s.gb_cpu, per_1k,
+                   100.0 * s.util_gpu(), 100.0 * s.util_cpu());
         }
     }
 
