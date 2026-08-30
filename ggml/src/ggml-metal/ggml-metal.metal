@@ -12366,3 +12366,41 @@ template [[host_name("kernel_mul_mm_id_w64_iq1_m_f16")]] kernel mul_mm_id_w64_t 
 template [[host_name("kernel_mul_mm_id_w64_iq4_nl_f16")]] kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half, half4x4, half, block_iq4_nl, 2, dequantize_iq4_nl, float, float4x4, half>;
 template [[host_name("kernel_mul_mm_id_w64_iq4_xs_f16")]] kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half, half4x4, half, block_iq4_xs, QK_NL, dequantize_iq4_xs, float, float4x4, half>;
 template [[host_name("kernel_mul_mm_id_w64_tq2_0_f16")]] kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half, half4x4, half, block_tq2_0, QK_NL, dequantize_tq2_0, float, float4x4, half>;
+
+// ---------------------------------------------------------------------------
+// MoE expert paging
+//
+// Copies expert slices from a host-resident (shared) buffer into slots of a
+// VRAM (private) pool. One threadgroup per admitted expert; threads stride over
+// the slice. Deliberately a compute kernel, not a blit: blits need their own
+// encoder, and switching encoders mid-graph costs more than the copy.
+//
+// Widest aligned unit only - a K-quant super-block is a multiple of 16 bytes and
+// nb02 is a whole number of blocks, so uint4 is always safe here.
+// ---------------------------------------------------------------------------
+kernel void kernel_moe_admit(
+        constant ggml_metal_kargs_moe_admit & args,
+        device const char  * src   [[buffer(1)]],
+        device       char  * pool  [[buffer(2)]],
+        device const int   * pairs [[buffer(3)]],   // [expert, slot] x n_admit
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+
+    const int i = (int) tgpig.x;
+    if (i >= args.n_admit) {
+        return;
+    }
+
+    const int e = pairs[2*i + 0];   // expert index in the full tensor
+    const int s = pairs[2*i + 1];   // destination slot in the pool
+
+    device const uint4 * sp = (device const uint4 *) (src  + (uint64_t) e * args.nb02);
+    device       uint4 * dp = (device       uint4 *) (pool + (uint64_t) s * args.nb02);
+
+    const uint64_t n16 = args.nb02 / 16;
+
+    for (uint64_t k = tpitg.x; k < n16; k += ntg.x) {
+        dp[k] = sp[k];
+    }
+}
