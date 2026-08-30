@@ -11,6 +11,8 @@
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
 
+#include <unistd.h>
+#include <cstring>
 #include <cassert>
 #include <mutex>
 #include <unordered_map>
@@ -35,7 +37,8 @@
 
 struct ggml_metal_moe_page {
     ggml_metal_buffer_t pool = nullptr;   // private: n_slots * nb02
-    ggml_metal_buffer_t meta = nullptr;   // shared: tables + scratch
+    ggml_metal_buffer_t meta = nullptr;   // host-mapped: tables + scratch
+    void *              meta_host = nullptr;
     int    n_slots  = 0;
     int    n_expert = 0;
     size_t nb02     = 0;
@@ -100,17 +103,32 @@ static ggml_metal_moe_page * ggml_metal_moe_get(
     const size_t meta_bytes = p->off_pairs + sizeof(int32_t)*2*max_ids;
 
     p->pool = ggml_metal_buffer_init(dev, (size_t) n_slots * nb02, false);
-    p->meta = ggml_metal_buffer_init(dev, meta_bytes, true);
 
-    if (!p->pool || !p->meta) {
+    // NOTE: ggml_metal_buffer_init() silently downgrades a shared request to
+    //       private when the device does not support shared buffers - and this
+    //       one does not. Its all_data is then a virtual address, so writing the
+    //       initial tables through get_base() segfaults. Map our own host pages
+    //       instead, which gives a real pointer and a Metal buffer over it.
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    const size_t meta_aligned = ((meta_bytes + page - 1)/page)*page;
+
+    if (posix_memalign(&p->meta_host, page, meta_aligned) != 0) {
+        p->meta_host = nullptr;
+    } else {
+        memset(p->meta_host, 0, meta_aligned);
+        p->meta = ggml_metal_buffer_map(dev, p->meta_host, meta_aligned, meta_aligned);
+    }
+
+    if (!p->pool || !p->meta || !p->meta_host) {
         GGML_LOG_ERROR("%s: failed to allocate MoE pool for '%s'\n", __func__, src0->name);
+        if (p->meta_host) { free(p->meta_host); }
         delete p;
         pages[src0] = nullptr;
         return nullptr;
     }
 
     // empty residency: nothing mapped, hand at zero
-    int32_t * base = (int32_t *) ggml_metal_buffer_get_base(p->meta);
+    int32_t * base = (int32_t *) p->meta_host;
     for (int i = 0; i < n_expert; ++i) { base[i] = -1; }
     for (int i = 0; i < n_slots;  ++i) { base[n_expert + i] = -1; }
     base[(p->off_hand    )/sizeof(int32_t)] = 0;
