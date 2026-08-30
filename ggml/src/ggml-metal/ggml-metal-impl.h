@@ -1405,6 +1405,12 @@ typedef struct {
 // VRAM slots. Runs as a compute kernel rather than a blit so it can be encoded
 // inside the existing compute pass instead of forcing an encoder switch.
 typedef struct {
+    int32_t n_ids;      // routing ids this step
+    int32_t n_slots;    // pool capacity
+    int32_t n_expert;   // experts in the full tensor
+} ggml_metal_kargs_moe_resolve;
+
+typedef struct {
     uint64_t nb02;      // bytes in one expert slice
     int32_t  n_admit;   // number of (expert, slot) pairs to copy
 } ggml_metal_kargs_moe_admit;

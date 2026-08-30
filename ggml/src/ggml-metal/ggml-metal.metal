@@ -12404,3 +12404,65 @@ kernel void kernel_moe_admit(
         dp[k] = sp[k];
     }
 }
+
+// ---------------------------------------------------------------------------
+// MoE residency resolution
+//
+// Decides, on device, which routed experts are already in the pool and which
+// must be admitted. This has to happen here rather than on the host: the routing
+// ids are produced by the argsort earlier in the same graph, so reading them
+// back during encoding would flush the pipeline once per MoE layer.
+//
+// Replacement is CLOCK (FIFO with a moving hand) rather than true LRU. Exact LRU
+// needs per-slot timestamps and a scan; on the traces we measured, recency is
+// dominated by whether an expert was used at all in the last few tokens, which
+// FIFO captures. Deliberately single-threaded: n_ids is 4-8, and serialising
+// removes every race on slot allocation for the cost of a few iterations.
+// ---------------------------------------------------------------------------
+kernel void kernel_moe_resolve(
+        constant ggml_metal_kargs_moe_resolve & args,
+        device const int * ids            [[buffer(1)]],  // [n_ids]
+        device       int * slot_of_expert [[buffer(2)]],  // [n_expert], -1 = absent
+        device       int * expert_of_slot [[buffer(3)]],  // [n_slots],  -1 = empty
+        device       int * hand           [[buffer(4)]],  // [1] clock position
+        device       int * out_ids        [[buffer(5)]],  // [n_ids] remapped to slots
+        device       int * admit_pairs    [[buffer(6)]],  // [2*n_ids] (expert, slot)
+        device       int * n_admit        [[buffer(7)]]) {// [1]
+
+    int n = 0;
+    int h = hand[0];
+
+    for (int i = 0; i < args.n_ids; ++i) {
+        const int e = ids[i];
+
+        if (e < 0 || e >= args.n_expert) {
+            out_ids[i] = 0;
+            continue;
+        }
+
+        int s = slot_of_expert[e];
+
+        if (s < 0) {
+            // miss: take the slot under the hand, evicting whatever is there
+            s = h;
+            h = (h + 1) % args.n_slots;
+
+            const int victim = expert_of_slot[s];
+            if (victim >= 0) {
+                slot_of_expert[victim] = -1;
+            }
+
+            slot_of_expert[e] = s;
+            expert_of_slot[s] = e;
+
+            admit_pairs[2*n + 0] = e;
+            admit_pairs[2*n + 1] = s;
+            n++;
+        }
+
+        out_ids[i] = s;
+    }
+
+    hand[0]    = h;
+    n_admit[0] = n;
+}
